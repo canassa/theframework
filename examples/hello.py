@@ -36,4 +36,4 @@ def get_user(request: Request, response: Response) -> None:
     response.write(json.dumps({"user_id": request.params["id"]}).encode())
 
 
-app.run(host="127.0.0.1", port=8000)
+app.run(host="127.0.0.1", port=8000, workers=0)  # 0 = auto-detect CPU count

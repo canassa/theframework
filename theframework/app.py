@@ -103,9 +103,18 @@ class Framework:
 
         return handler
 
-    def run(self, host: str = "127.0.0.1", port: int = 8000) -> None:
-        """Start the server."""
-        serve(self._make_handler(), host, port)
+    def run(
+        self, host: str = "127.0.0.1", port: int = 8000, *, workers: int = 1
+    ) -> None:
+        """Start the server.
+
+        Args:
+            host: Address to bind to.
+            port: Port to bind to.
+            workers: Number of worker processes. 1 = single-process (default).
+                     0 = auto-detect from CPU count.
+        """
+        serve(self._make_handler(), host, port, workers=workers)
 
 
 def _build_chain(middlewares: list[MiddlewareFunc], handler: HandlerFunc) -> HandlerFunc:
