@@ -1,11 +1,14 @@
-<img width="1536" height="1024" alt="Image" src="https://github.com/user-attachments/assets/ddbfa0d9-523c-4ece-bbb3-ca66b5efdd45" />
+<img width="1212" height="469" alt="Image" src="https://github.com/user-attachments/assets/2396a624-fe5f-4936-917e-14e0fb9d628a" />
 
 <h1 align="center">theframework</h1>
 
 A fast Python HTTP framework powered by io_uring and greenlets.
 
-All I/O is cooperative — handlers can sleep, make outbound connections, or wait
-on slow clients without blocking other requests.
+## Rationale
+
+- **No async/await**: Write synchronous code. The runtime handles concurrency for you.
+- **Ultimate performance**: io_uring completion-based I/O, pre-fork parallelism.
+- **Custom HTTP server in Zig**: SIMD HTTP parser, zero-copy I/O, direct kernel integration.
 
 ## Quickstart
 
