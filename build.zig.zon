@@ -1,0 +1,17 @@
+.{
+    .name = .framework,
+    .version = "0.0.1",
+    .fingerprint = 0x9d766e195dbf4fda,
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        .hparse = .{
+            .url = "https://github.com/nikneym/hparse/archive/4fb3d836e804eab0469bb128f521ad00b1085731.tar.gz",
+            .hash = "hparse-0.2.0-IukW0s67AADCDZ7ROogFU5EJAVLyI8aiR0LPNvZd88OK",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

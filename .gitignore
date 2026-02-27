@@ -1,0 +1,17 @@
+zig-out/
+.zig-cache/
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.venv/
+.pytest_cache/
+.coverage
+.vscode/
+.idea/
+*.db
+_framework_core*.so
+.direnv/
+.DS_Store
+.claude/agent-memory/
