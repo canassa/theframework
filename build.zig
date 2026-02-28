@@ -59,34 +59,6 @@ pub fn build(b: *std.Build) void {
     b.getInstallStep().dependOn(&ext_install.step);
 
     // -----------------------------------------------------------------------
-    // Executable: echo_server
-    // -----------------------------------------------------------------------
-    const echo_server = b.addExecutable(.{
-        .name = "echo_server",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/echo_server.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-
-    b.installArtifact(echo_server);
-
-    // -----------------------------------------------------------------------
-    // Executable: echo_server_v2
-    // -----------------------------------------------------------------------
-    const echo_server_v2 = b.addExecutable(.{
-        .name = "echo_server_v2",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/echo_server_v2.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-
-    b.installArtifact(echo_server_v2);
-
-    // -----------------------------------------------------------------------
     // hparse dependency (HTTP parser)
     // -----------------------------------------------------------------------
     const hparse_dep = b.dependency("hparse", .{ .target = target, .optimize = optimize });
