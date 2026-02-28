@@ -5,10 +5,10 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // User-configurable paths (with sensible defaults)
-    const python_include = b.option([]const u8, "python-include", "Python include directory (e.g. /usr/include/python3.13)") orelse "/home/canassa/.local/share/uv/python/cpython-3.13.11-linux-x86_64-gnu/include/python3.13";
-    const greenlet_include = b.option([]const u8, "greenlet-include", "Greenlet include directory (contains greenlet.h)") orelse ".venv/lib/python3.13/site-packages/greenlet";
-    const python_lib = b.option([]const u8, "python-lib", "Python library directory (e.g. /usr/lib)") orelse "/home/canassa/.local/share/uv/python/cpython-3.13.11-linux-x86_64-gnu/lib";
-    const ext_suffix = b.option([]const u8, "ext-suffix", "Python extension suffix (e.g. .cpython-313-x86_64-linux-gnu.so)") orelse ".cpython-313-x86_64-linux-gnu";
+    const python_include = b.option([]const u8, "python-include", "Python include directory (e.g. /usr/include/python3.14)") orelse "/home/canassa/.local/share/uv/python/cpython-3.14.3-linux-x86_64-gnu/include/python3.14";
+    const greenlet_include = b.option([]const u8, "greenlet-include", "Greenlet include directory (contains greenlet.h)") orelse ".venv/lib/python3.14/site-packages/greenlet";
+    const python_lib = b.option([]const u8, "python-lib", "Python library directory (e.g. /usr/lib)") orelse "/home/canassa/.local/share/uv/python/cpython-3.14.3-linux-x86_64-gnu/lib";
+    const ext_suffix = b.option([]const u8, "ext-suffix", "Python extension suffix (e.g. .cpython-314-x86_64-linux-gnu.so)") orelse ".cpython-314-x86_64-linux-gnu";
 
     // -----------------------------------------------------------------------
     // Shared library: libframework.so
@@ -204,7 +204,7 @@ pub fn build(b: *std.Build) void {
     hub_test_mod.addIncludePath(.{ .cwd_relative = python_include });
     hub_test_mod.addIncludePath(.{ .cwd_relative = greenlet_include });
     hub_test_mod.addLibraryPath(.{ .cwd_relative = python_lib });
-    hub_test_mod.linkSystemLibrary("python3.13", .{});
+    hub_test_mod.linkSystemLibrary("python3.14", .{});
     const hub_tests = b.addTest(.{ .root_module = hub_test_mod });
     hub_tests.addCSourceFile(.{
         .file = b.path("src/py_helpers.c"),
