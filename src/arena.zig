@@ -180,6 +180,15 @@ pub const RequestArena = struct {
     pub fn currentChunkRemaining(self: *const RequestArena) usize {
         return Chunk.CHUNK_SIZE - self.chunk_offset;
     }
+
+    /// Allocate a typed slice of `n` elements from the arena with proper alignment.
+    /// Returns null if the hard limit is exceeded or OOM.
+    /// The returned slice remains valid until reset().
+    pub fn allocSlice(self: *RequestArena, comptime T: type, n: usize) ?[]T {
+        const byte_count = @sizeOf(T) * n;
+        const bytes = self.alloc(byte_count) orelse return null;
+        return @as([*]T, @ptrCast(@alignCast(bytes.ptr)))[0..n];
+    }
 };
 
 // ---------------------------------------------------------------------------

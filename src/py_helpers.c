@@ -85,6 +85,10 @@ int py_helper_tuple_setitem(PyObject *tuple, Py_ssize_t pos, PyObject *item) {
     return PyTuple_SetItem(tuple, pos, item);
 }
 
+PyObject *py_helper_tuple_getitem(PyObject *tuple, Py_ssize_t pos) {
+    return PyTuple_GetItem(tuple, pos);
+}
+
 /* --- Error handling --- */
 
 PyObject *py_helper_err_occurred(void) {

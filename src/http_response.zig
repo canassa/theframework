@@ -6,13 +6,19 @@ pub const StatusCode = enum(u16) {
     created = 201,
     no_content = 204,
     moved_permanently = 301,
+    found = 302,
+    not_modified = 304,
     bad_request = 400,
+    unauthorized = 401,
+    forbidden = 403,
     not_found = 404,
     method_not_allowed = 405,
     payload_too_large = 413,
     request_header_fields_too_large = 431,
     internal_server_error = 500,
+    bad_gateway = 502,
     service_unavailable = 503,
+    gateway_timeout = 504,
 
     /// Returns the numeric HTTP status code.
     pub fn code(self: StatusCode) u16 {
@@ -26,13 +32,19 @@ pub const StatusCode = enum(u16) {
             .created => "Created",
             .no_content => "No Content",
             .moved_permanently => "Moved Permanently",
+            .found => "Found",
+            .not_modified => "Not Modified",
             .bad_request => "Bad Request",
+            .unauthorized => "Unauthorized",
+            .forbidden => "Forbidden",
             .not_found => "Not Found",
             .method_not_allowed => "Method Not Allowed",
             .payload_too_large => "Payload Too Large",
             .request_header_fields_too_large => "Request Header Fields Too Large",
             .internal_server_error => "Internal Server Error",
+            .bad_gateway => "Bad Gateway",
             .service_unavailable => "Service Unavailable",
+            .gateway_timeout => "Gateway Timeout",
         };
     }
 };

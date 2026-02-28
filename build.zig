@@ -7,6 +7,7 @@ pub fn build(b: *std.Build) void {
     // User-configurable paths (with sensible defaults)
     const python_include = b.option([]const u8, "python-include", "Python include directory (e.g. /usr/include/python3.13)") orelse "/home/canassa/.local/share/uv/python/cpython-3.13.11-linux-x86_64-gnu/include/python3.13";
     const greenlet_include = b.option([]const u8, "greenlet-include", "Greenlet include directory (contains greenlet.h)") orelse ".venv/lib/python3.13/site-packages/greenlet";
+    const python_lib = b.option([]const u8, "python-lib", "Python library directory (e.g. /usr/lib)") orelse "/home/canassa/.local/share/uv/python/cpython-3.13.11-linux-x86_64-gnu/lib";
     const ext_suffix = b.option([]const u8, "ext-suffix", "Python extension suffix (e.g. .cpython-313-x86_64-linux-gnu.so)") orelse ".cpython-313-x86_64-linux-gnu";
 
     // -----------------------------------------------------------------------
@@ -189,6 +190,59 @@ pub fn build(b: *std.Build) void {
     const arena_tests = b.addTest(.{ .root_module = arena_test_mod });
     const run_arena_tests = b.addRunArtifact(arena_tests);
 
+    // Tests for buffer_recycler.zig (power-of-2 buffer recycling)
+    const buf_recycler_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/buffer_recycler.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_buf_recycler_tests = b.addRunArtifact(buf_recycler_tests);
+
+    // Tests for input_buffer.zig (contiguous recv buffer)
+    const input_buffer_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/input_buffer.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_input_buffer_tests = b.addRunArtifact(input_buffer_tests);
+
+    // Tests for test_input_buffer.zig (comprehensive InputBuffer + BufferRecycler tests)
+    const input_buffer_integration_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_input_buffer.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_input_buffer_integration_tests = b.addRunArtifact(input_buffer_integration_tests);
+
+    // Tests for hub.zig (tryParse, etc. — needs Python/greenlet headers and hparse)
+    const hub_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/hub.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    hub_test_mod.addImport("hparse", hparse_mod);
+    hub_test_mod.addIncludePath(b.path("src"));
+    hub_test_mod.addIncludePath(.{ .cwd_relative = python_include });
+    hub_test_mod.addIncludePath(.{ .cwd_relative = greenlet_include });
+    hub_test_mod.addLibraryPath(.{ .cwd_relative = python_lib });
+    hub_test_mod.linkSystemLibrary("python3.13", .{});
+    const hub_tests = b.addTest(.{ .root_module = hub_test_mod });
+    hub_tests.addCSourceFile(.{
+        .file = b.path("src/py_helpers.c"),
+        .flags = &.{},
+    });
+    hub_tests.root_module.addIncludePath(b.path("src"));
+    hub_tests.root_module.addIncludePath(.{ .cwd_relative = python_include });
+    hub_tests.root_module.addIncludePath(.{ .cwd_relative = greenlet_include });
+    const run_hub_tests = b.addRunArtifact(hub_tests);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_ring_tests.step);
@@ -199,4 +253,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_config_tests.step);
     test_step.dependOn(&run_chunk_pool_tests.step);
     test_step.dependOn(&run_arena_tests.step);
+    test_step.dependOn(&run_buf_recycler_tests.step);
+    test_step.dependOn(&run_input_buffer_tests.step);
+    test_step.dependOn(&run_input_buffer_integration_tests.step);
+    test_step.dependOn(&run_hub_tests.step);
 }

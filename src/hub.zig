@@ -10,11 +10,15 @@ const Connection = conn_mod.Connection;
 const ConnectionPool = conn_mod.ConnectionPool;
 const ConnectionState = conn_mod.ConnectionState;
 const http = @import("http.zig");
+const hparse = @import("hparse");
 const http_response = @import("http_response.zig");
 const config_mod = @import("config.zig");
 const ArenaConfig = config_mod.ArenaConfig;
 const chunk_pool = @import("chunk_pool.zig");
 const ChunkRecycler = chunk_pool.ChunkRecycler;
+const arena_mod = @import("arena.zig");
+const RequestArena = arena_mod.RequestArena;
+const BufferRecycler = @import("buffer_recycler.zig").BufferRecycler;
 
 const py = @cImport({
     @cInclude("py_helpers.h");
@@ -33,6 +37,8 @@ const IGNORE_SENTINEL: u64 = std.math.maxInt(u64) - 2;
 const CQE_BATCH_SIZE: usize = 256;
 const MAX_POLL_FDS: usize = 64;
 const IOSQE_IO_LINK: u8 = 1 << 2;
+const RECV_SIZE: usize = 8192;
+const INITIAL_HEADER_CAPACITY: usize = 32;
 
 // ---------------------------------------------------------------------------
 // Hub struct
@@ -56,6 +62,7 @@ pub const Hub = struct {
     allocator: std.mem.Allocator,
     config: ArenaConfig,
     recycler: ChunkRecycler,
+    buf_recycler: BufferRecycler,
 
     pub fn init(allocator: std.mem.Allocator, config: ArenaConfig) !Hub {
         const ring = try Ring.init(256);
@@ -67,7 +74,10 @@ pub const Hub = struct {
         var recycler = ChunkRecycler.init(allocator);
         errdefer recycler.deinit();
 
-        var pool = try ConnectionPool.init(allocator, config, &recycler);
+        var buf_recycler = BufferRecycler.init(allocator);
+        errdefer buf_recycler.deinit();
+
+        var pool = try ConnectionPool.init(allocator, config, &recycler, &buf_recycler);
         errdefer pool.deinit();
 
         var op_slots = try OpSlotTable.init(allocator);
@@ -92,6 +102,7 @@ pub const Hub = struct {
             .allocator = allocator,
             .config = config,
             .recycler = recycler,
+            .buf_recycler = buf_recycler,
         };
     }
 
@@ -141,6 +152,7 @@ pub const Hub = struct {
         }
 
         self.recycler.deinit();
+        self.buf_recycler.deinit();
         self.pool.deinit();
         self.ring.deinit();
     }
@@ -628,6 +640,61 @@ pub const Hub = struct {
         const none = py.py_helper_none();
         py.py_helper_incref(none);
         return none;
+    }
+
+    // -----------------------------------------------------------------------
+    // doRecv: internal recv helper for pyHttpReadRequest
+    // -----------------------------------------------------------------------
+
+    /// Submit a recv SQE for `buf`, suspend the greenlet, return bytes read.
+    /// Returns null on error (Python exception already set).
+    /// Returns 0 for EOF.
+    fn doRecv(
+        self: *Hub,
+        fd: posix.fd_t,
+        conn: *Connection,
+        buf: []u8,
+    ) ?usize {
+        const current = py.py_helper_greenlet_getcurrent() orelse return null;
+
+        const user_data = conn_mod.encodeUserData(conn.pool_index, conn.generation);
+        _ = self.ring.prepRecv(fd, buf, user_data) catch {
+            py.py_helper_decref(current);
+            py.py_helper_err_set_string(
+                py.py_helper_exc_oserror(),
+                "doRecv: failed to submit recv SQE",
+            );
+            return null;
+        };
+
+        conn.greenlet = current;
+        conn.state = .reading;
+        conn.pending_ops += 1;
+        self.active_waits += 1;
+
+        const hub_g = self.hub_greenlet orelse {
+            py.py_helper_err_set_string(
+                py.py_helper_exc_runtime_error(),
+                "doRecv: hub greenlet not set",
+            );
+            conn.greenlet = null;
+            conn.state = .idle;
+            conn.pending_ops -= 1;
+            self.active_waits -= 1;
+            py.py_helper_decref(current);
+            return null;
+        };
+        const switch_result = py.py_helper_greenlet_switch(hub_g, null, null);
+        if (switch_result == null) return null;
+        py.py_helper_decref(switch_result);
+
+        const res = conn.result;
+        if (res < 0) {
+            py.py_helper_err_set_from_errno(-res);
+            return null;
+        }
+
+        return @intCast(res);
     }
 
     // -----------------------------------------------------------------------
@@ -1440,10 +1507,11 @@ pub fn pyHubRun(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
         );
         return null;
     };
-    // Fix up arena recycler pointers: Hub.init() returns by value, so the
-    // recycler moved to hub_ptr.recycler. Arenas still point to the old
-    // (dead) stack address. Re-point them to the final heap address.
+    // Fix up recycler pointers: Hub.init() returns by value, so both
+    // recyclers moved to hub_ptr. Arenas and InputBuffers still point
+    // to the old (dead) stack address. Re-point them to the final heap address.
     hub_ptr.pool.fixupRecycler(&hub_ptr.recycler);
+    hub_ptr.pool.fixupBufRecycler(&hub_ptr.buf_recycler);
     global_hub = hub_ptr;
 
     // The current greenlet IS the hub greenlet
@@ -1839,13 +1907,19 @@ fn statusFromInt(code: u16) ?http_response.StatusCode {
         201 => .created,
         204 => .no_content,
         301 => .moved_permanently,
+        302 => .found,
+        304 => .not_modified,
         400 => .bad_request,
+        401 => .unauthorized,
+        403 => .forbidden,
         404 => .not_found,
         405 => .method_not_allowed,
         413 => .payload_too_large,
         431 => .request_header_fields_too_large,
         500 => .internal_server_error,
+        502 => .bad_gateway,
         503 => .service_unavailable,
+        504 => .gateway_timeout,
         else => null,
     };
 }
@@ -1973,4 +2047,832 @@ pub fn pyHttpFormatResponse(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyOb
     };
 
     return py.py_helper_bytes_from_string_and_size(@ptrCast(&buf), @intCast(n));
+}
+
+/// Extracts a `[]const u8` slice from a Python bytes object.
+/// Returns the slice on success, or null if the object is not valid bytes.
+fn extractBytesSlice(obj: *PyObject) ?[]const u8 {
+    const ptr: [*]const u8 = @ptrCast(py.py_helper_bytes_as_string(obj) orelse return null);
+    const len: usize = @intCast(py.py_helper_bytes_get_size(obj));
+    return ptr[0..len];
+}
+
+/// Heap-allocated fallback for responses that exceed the 64 KB stack buffer.
+fn formatLargeResponse(
+    status: http_response.StatusCode,
+    headers: []const http_response.Header,
+    body: []const u8,
+) ?*PyObject {
+    // Estimate size: status line (~30) + headers (~100 each) + body
+    const est = 256 + headers.len * 128 + body.len;
+    const buf = std.heap.c_allocator.alloc(u8, est) catch {
+        _ = py.py_helper_err_no_memory();
+        return null;
+    };
+    defer std.heap.c_allocator.free(buf);
+
+    const n = http_response.writeResponse(buf, status, headers, body) catch {
+        py.py_helper_err_set_string(
+            py.py_helper_exc_runtime_error(),
+            "Response too large",
+        );
+        return null;
+    };
+
+    return py.py_helper_bytes_from_string_and_size(@ptrCast(buf.ptr), @intCast(n));
+}
+
+/// http_format_response_full(status, headers, body) -> bytes
+///
+/// Formats a complete HTTP/1.1 response from status code, a list of
+/// (name, value) header tuples, and a body bytes object.
+/// Uses a 64 KB stack buffer for typical responses; falls back to heap
+/// allocation for larger ones.
+pub fn pyHttpFormatResponseFull(
+    _: ?*PyObject,
+    args: ?*PyObject,
+) callconv(.c) ?*PyObject {
+    var status_long: c_long = 0;
+    var headers_list: ?*PyObject = null;
+    var body_obj: ?*PyObject = null;
+    if (py.PyArg_ParseTuple(args, "lOS", &status_long, &headers_list, &body_obj) == 0)
+        return null;
+
+    // Convert status code integer to StatusCode enum
+    const status_code: u16 = @intCast(status_long);
+    const status = statusFromInt(status_code) orelse {
+        py.py_helper_err_set_string(
+            py.py_helper_exc_value_error(),
+            "Unsupported HTTP status code",
+        );
+        return null;
+    };
+
+    // Extract body pointer and length
+    const body_ptr: [*]const u8 = @ptrCast(py.py_helper_bytes_as_string(body_obj.?) orelse {
+        py.py_helper_err_set_string(
+            py.py_helper_exc_runtime_error(),
+            "http_format_response_full: invalid body bytes",
+        );
+        return null;
+    });
+    const body_len: usize = @intCast(py.py_helper_bytes_get_size(body_obj.?));
+    const body_slice = body_ptr[0..body_len];
+
+    // Extract headers from Python list of (bytes, bytes) tuples
+    const n_headers_raw = py.PyList_Size(headers_list.?);
+    if (n_headers_raw < 0) return null;
+    const n_headers: usize = @intCast(n_headers_raw);
+
+    // Use stack array for up to 64 headers; heap-allocate for more
+    var stack_headers: [64]http_response.Header = undefined;
+    var heap_headers: ?[]http_response.Header = null;
+    defer if (heap_headers) |h| std.heap.c_allocator.free(h);
+
+    const zig_headers: []http_response.Header = if (n_headers <= 64)
+        stack_headers[0..n_headers]
+    else blk: {
+        heap_headers = std.heap.c_allocator.alloc(http_response.Header, n_headers) catch {
+            _ = py.py_helper_err_no_memory();
+            return null;
+        };
+        break :blk heap_headers.?;
+    };
+
+    for (0..n_headers) |i| {
+        const pair = py.PyList_GetItem(headers_list.?, @intCast(i)) orelse return null;
+        const name_obj = py.py_helper_tuple_getitem(pair, 0) orelse return null;
+        const val_obj = py.py_helper_tuple_getitem(pair, 1) orelse return null;
+
+        const name_slice = extractBytesSlice(name_obj) orelse {
+            py.py_helper_err_set_string(
+                py.py_helper_exc_runtime_error(),
+                "http_format_response_full: invalid header name bytes",
+            );
+            return null;
+        };
+        const val_slice = extractBytesSlice(val_obj) orelse {
+            py.py_helper_err_set_string(
+                py.py_helper_exc_runtime_error(),
+                "http_format_response_full: invalid header value bytes",
+            );
+            return null;
+        };
+
+        zig_headers[i] = .{
+            .name = name_slice,
+            .value = val_slice,
+        };
+    }
+
+    // Format into 64 KB stack buffer
+    var buf: [65536]u8 = undefined;
+    const n = http_response.writeResponse(&buf, status, zig_headers, body_slice) catch {
+        // Response too large for stack buffer — fall back to heap
+        return formatLargeResponse(status, zig_headers, body_slice);
+    };
+
+    return py.py_helper_bytes_from_string_and_size(@ptrCast(&buf), @intCast(n));
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2: http_read_request — combined recv + accumulate + parse
+// ---------------------------------------------------------------------------
+
+/// Parsed result. `headers` is a slice into arena memory.
+/// Valid until the arena is reset (end of request).
+const ParsedRequest = struct {
+    method: http.Method,
+    path: []const u8, // zero-copy slice into InputBuffer
+    version: http.Version,
+    headers: []const http.Header, // arena-allocated, values point into InputBuffer
+    body: []const u8, // zero-copy slice into InputBuffer
+    raw_bytes_consumed: usize,
+    keep_alive: bool,
+};
+
+const ParseResult = union(enum) {
+    complete: ParsedRequest,
+    incomplete,
+    invalid,
+    header_too_large,
+    body_too_large,
+    arena_oom,
+};
+
+/// Parse with arena-allocated headers. No fixed limit on header count.
+///
+/// Like h2o: header structs live in the per-request arena (bump-allocated),
+/// header name/value slices are zero-copy pointers into buf (the InputBuffer).
+/// If 32 headers aren't enough, we double and re-parse from the arena.
+fn tryParse(
+    buf: []const u8,
+    max_header_size: usize,
+    max_body_size: usize,
+    arena: *RequestArena,
+) ParseResult {
+    var capacity: usize = INITIAL_HEADER_CAPACITY;
+
+    // Allocate initial header array from the arena (bump allocation, O(1))
+    var headers = arena.allocSlice(http.Header, capacity) orelse return .arena_oom;
+
+    while (true) {
+        var method: http.Method = .unknown;
+        var path: ?[]const u8 = null;
+        var version: http.Version = .@"1.0";
+        var header_count: usize = 0;
+
+        const header_bytes = hparse.parseRequest(
+            buf,
+            &method,
+            &path,
+            &version,
+            headers,
+            &header_count,
+        ) catch |err| switch (err) {
+            error.Incomplete => return .incomplete,
+            error.Invalid => return .invalid,
+        };
+
+        // If hparse filled the entire slice, there may be more headers.
+        // Grow and re-parse (like h2o's pool — just bump-allocate more).
+        // The old allocation is abandoned in the arena (freed at request end).
+        if (header_count == capacity) {
+            capacity *= 2;
+            headers = arena.allocSlice(http.Header, capacity) orelse return .arena_oom;
+            continue; // re-parse with larger slice
+        }
+
+        // Headers fit. Now validate limits.
+        if (header_bytes > max_header_size) return .header_too_large;
+
+        // Determine body length
+        const content_length: usize = blk: {
+            const cl = http.findHeader(headers[0..header_count], "content-length") orelse break :blk 0;
+            const trimmed = std.mem.trim(u8, cl, &std.ascii.whitespace);
+            break :blk std.fmt.parseInt(usize, trimmed, 10) catch return .invalid;
+        };
+
+        if (content_length > max_body_size) return .body_too_large;
+        if (buf.len < header_bytes + content_length) return .incomplete;
+
+        // Resolve keep-alive
+        const ka = blk: {
+            if (http.findHeader(headers[0..header_count], "connection")) |conn_hdr| {
+                if (std.ascii.eqlIgnoreCase(conn_hdr, "close")) break :blk false;
+                if (std.ascii.eqlIgnoreCase(conn_hdr, "keep-alive")) break :blk true;
+            }
+            break :blk version == .@"1.1";
+        };
+
+        return .{ .complete = .{
+            .method = method,
+            .path = path orelse return .invalid,
+            .version = version,
+            .headers = headers[0..header_count], // arena-owned slice
+            .body = buf[header_bytes .. header_bytes + content_length],
+            .raw_bytes_consumed = header_bytes + content_length,
+            .keep_alive = ka,
+        } };
+    }
+}
+
+/// Convert a parsed request to a Python 5-tuple.
+///
+/// IMPORTANT: Must be called BEFORE conn.input.consume() — header slices
+/// are zero-copy pointers into the InputBuffer's unconsumed region.
+/// After consume(), those bytes are logically freed and may be overwritten
+/// by a future compact().
+///
+/// Returns (method, path, body, keep_alive, headers).
+fn buildPyResult(req: ParsedRequest) ?*PyObject {
+    // Method string
+    const method_str = methodToStr(req.method);
+    const py_method = py.PyUnicode_FromStringAndSize(
+        method_str.ptr,
+        @intCast(method_str.len),
+    ) orelse return null;
+
+    // Path string (zero-copy slice into InputBuffer -> copy to Python)
+    const py_path = py.PyUnicode_FromStringAndSize(
+        req.path.ptr,
+        @intCast(req.path.len),
+    ) orelse {
+        py.py_helper_decref(py_method);
+        return null;
+    };
+
+    // Body bytes (zero-copy slice into InputBuffer -> copy to Python)
+    const py_body = py.py_helper_bytes_from_string_and_size(
+        @ptrCast(req.body.ptr),
+        @intCast(req.body.len),
+    ) orelse {
+        py.py_helper_decref(py_method);
+        py.py_helper_decref(py_path);
+        return null;
+    };
+
+    // Keep-alive bool
+    const py_ka = if (req.keep_alive) py.py_helper_true() else py.py_helper_false();
+    py.py_helper_incref(py_ka);
+
+    // Headers: list[tuple[bytes, bytes]]
+    const py_headers = buildPyHeaders(req.headers) orelse {
+        py.py_helper_decref(py_method);
+        py.py_helper_decref(py_path);
+        py.py_helper_decref(py_body);
+        py.py_helper_decref(py_ka);
+        return null;
+    };
+
+    // Build 5-tuple: (method, path, body, keep_alive, headers)
+    const tuple = py.py_helper_tuple_new(5) orelse {
+        py.py_helper_decref(py_method);
+        py.py_helper_decref(py_path);
+        py.py_helper_decref(py_body);
+        py.py_helper_decref(py_ka);
+        py.py_helper_decref(py_headers);
+        return null;
+    };
+
+    // PyTuple_SetItem steals references
+    _ = py.py_helper_tuple_setitem(tuple, 0, py_method);
+    _ = py.py_helper_tuple_setitem(tuple, 1, py_path);
+    _ = py.py_helper_tuple_setitem(tuple, 2, py_body);
+    _ = py.py_helper_tuple_setitem(tuple, 3, py_ka);
+    _ = py.py_helper_tuple_setitem(tuple, 4, py_headers);
+
+    return tuple;
+}
+
+/// Convert arena-allocated headers to Python list[tuple[bytes, bytes]].
+/// Each header's .key/.value are zero-copy slices into the InputBuffer.
+/// This function copies the bytes into Python objects, after which
+/// the InputBuffer region can be safely consumed.
+fn buildPyHeaders(headers: []const http.Header) ?*PyObject {
+    const list = py.PyList_New(@intCast(headers.len)) orelse return null;
+    for (headers, 0..) |hdr, i| {
+        const key = py.py_helper_bytes_from_string_and_size(
+            @ptrCast(hdr.key.ptr),
+            @intCast(hdr.key.len),
+        ) orelse {
+            py.py_helper_decref(list);
+            return null;
+        };
+
+        const val = py.py_helper_bytes_from_string_and_size(
+            @ptrCast(hdr.value.ptr),
+            @intCast(hdr.value.len),
+        ) orelse {
+            py.py_helper_decref(key);
+            py.py_helper_decref(list);
+            return null;
+        };
+
+        const header_tuple = py.py_helper_tuple_new(2) orelse {
+            py.py_helper_decref(val);
+            py.py_helper_decref(key);
+            py.py_helper_decref(list);
+            return null;
+        };
+        _ = py.py_helper_tuple_setitem(header_tuple, 0, key); // steals ref
+        _ = py.py_helper_tuple_setitem(header_tuple, 1, val); // steals ref
+        _ = py.PyList_SetItem(list, @intCast(i), header_tuple); // steals ref
+    }
+    return list;
+}
+
+/// Return Python None (with incref).
+fn pyNone() ?*PyObject {
+    const none = py.py_helper_none();
+    py.py_helper_incref(none);
+    return none;
+}
+
+fn raiseValueError() ?*PyObject {
+    py.py_helper_err_set_string(
+        py.py_helper_exc_value_error(),
+        "Invalid HTTP request",
+    );
+    return null;
+}
+
+fn raiseHeaderTooLarge() ?*PyObject {
+    py.py_helper_err_set_string(
+        py.py_helper_exc_runtime_error(),
+        "request header too large",
+    );
+    return null;
+}
+
+fn raiseBodyTooLarge() ?*PyObject {
+    py.py_helper_err_set_string(
+        py.py_helper_exc_runtime_error(),
+        "request body too large",
+    );
+    return null;
+}
+
+fn raiseArenaExhausted() ?*PyObject {
+    py.py_helper_err_set_string(
+        py.py_helper_exc_runtime_error(),
+        "arena exhausted",
+    );
+    return null;
+}
+
+fn raiseRequestTooLarge() ?*PyObject {
+    py.py_helper_err_set_string(
+        py.py_helper_exc_runtime_error(),
+        "request too large",
+    );
+    return null;
+}
+
+/// http_read_request(fd, max_header_size, max_body_size) -> tuple | None
+///
+/// Combined recv + accumulate + parse in Zig. No Python-side accumulation.
+/// Uses the connection's InputBuffer for zero-copy accumulation.
+/// Returns structured request data to Python as
+/// (method, path, body, keep_alive, headers) or None on EOF.
+///
+/// Raises:
+///   ValueError: Malformed HTTP (400 Bad Request).
+///   RuntimeError: Request too large (413 / 431) or arena exhausted.
+///   OSError: Network error.
+pub fn pyHttpReadRequest(
+    _: ?*PyObject,
+    args: ?*PyObject,
+) callconv(.c) ?*PyObject {
+    var fd_long: c_long = 0;
+    var max_header_size_long: c_long = 0;
+    var max_body_size_long: c_long = 0;
+    if (py.PyArg_ParseTuple(
+        args,
+        "lll",
+        &fd_long,
+        &max_header_size_long,
+        &max_body_size_long,
+    ) == 0) return null;
+
+    const hub_ptr = getHub() orelse {
+        py.py_helper_err_set_string(
+            py.py_helper_exc_runtime_error(),
+            "http_read_request: hub not running",
+        );
+        return null;
+    };
+
+    const fd: posix.fd_t = @intCast(fd_long);
+    const max_header_size: usize = @intCast(max_header_size_long);
+    const max_body_size: usize = @intCast(max_body_size_long);
+
+    const conn = hub_ptr.getConn(fd) orelse {
+        py.py_helper_err_set_string(
+            py.py_helper_exc_oserror(),
+            "http_read_request: no connection for fd",
+        );
+        return null;
+    };
+
+    // -- STEP 0: Reset arena + compact leftover data --
+    conn.arena.reset(); // return arena chunks to recycler
+    conn.input.resetForNewRequest();
+
+    // -- STEP 1: Try parsing from leftover data (pipelining) --
+    if (conn.input.unconsumedLen() > 0) {
+        const result = tryParse(
+            conn.input.unconsumed(),
+            max_header_size,
+            max_body_size,
+            &conn.arena,
+        );
+        switch (result) {
+            .complete => |req| {
+                // Build Python objects BEFORE consume -- header slices
+                // point into InputBuffer's unconsumed region
+                const py_result = buildPyResult(req) orelse return null;
+                conn.input.consume(req.raw_bytes_consumed);
+                return py_result;
+            },
+            .incomplete => {}, // fall through to recv
+            .invalid => return raiseValueError(),
+            .header_too_large => return raiseHeaderTooLarge(),
+            .body_too_large => return raiseBodyTooLarge(),
+            .arena_oom => return raiseArenaExhausted(),
+        }
+    }
+
+    // -- STEP 2: Recv loop until complete request --
+    while (true) {
+        // Ensure space for recv
+        const free = conn.input.reserveFree(RECV_SIZE) catch {
+            return raiseArenaExhausted();
+        };
+        const recv_len = @min(free.len, RECV_SIZE);
+
+        // Submit recv SQE, suspend greenlet, resume on completion
+        const nbytes = hub_ptr.doRecv(fd, conn, free[0..recv_len]) orelse {
+            return null; // error already set
+        };
+
+        if (nbytes == 0) {
+            // EOF: client closed connection
+            if (conn.input.unconsumedLen() > 0) {
+                // Partial request in buffer -- malformed
+                return raiseValueError(); // 400
+            }
+            // Clean close (no pending data)
+            return pyNone();
+        }
+
+        conn.input.commitWrite(nbytes);
+
+        // Hard limit check: total accumulated data
+        if (conn.input.unconsumedLen() > max_header_size + max_body_size) {
+            return raiseRequestTooLarge();
+        }
+
+        // Reset arena before re-parsing (discard any partial parse allocations)
+        conn.arena.reset();
+
+        // Try parsing -- headers allocated from arena
+        const result = tryParse(
+            conn.input.unconsumed(),
+            max_header_size,
+            max_body_size,
+            &conn.arena,
+        );
+        switch (result) {
+            .complete => |req| {
+                // Build Python objects BEFORE consume -- header slices
+                // point into InputBuffer's unconsumed region
+                const py_result = buildPyResult(req) orelse return null;
+                conn.input.consume(req.raw_bytes_consumed);
+                return py_result;
+            },
+            .incomplete => continue, // recv more
+            .invalid => return raiseValueError(),
+            .header_too_large => return raiseHeaderTooLarge(),
+            .body_too_large => return raiseBodyTooLarge(),
+            .arena_oom => return raiseArenaExhausted(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests for tryParse
+// ---------------------------------------------------------------------------
+
+test "tryParse: simple GET request" {
+    const allocator = std.testing.allocator;
+    var recycler = ChunkRecycler.init(allocator);
+    defer recycler.deinit();
+
+    const first_chunk = try allocator.create(chunk_pool.Chunk);
+    defer allocator.destroy(first_chunk);
+
+    const config = ArenaConfig.defaults();
+    var arena = RequestArena.init(first_chunk, &recycler, config);
+    defer arena.reset();
+
+    const buf = "GET /hello HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    const result = tryParse(buf, 32768, 1_048_576, &arena);
+    switch (result) {
+        .complete => |req| {
+            try std.testing.expectEqual(http.Method.get, req.method);
+            try std.testing.expectEqualStrings("/hello", req.path);
+            try std.testing.expectEqual(http.Version.@"1.1", req.version);
+            try std.testing.expectEqual(@as(usize, 1), req.headers.len);
+            try std.testing.expectEqualStrings("Host", req.headers[0].key);
+            try std.testing.expectEqualStrings("localhost", req.headers[0].value);
+            try std.testing.expectEqualStrings("", req.body);
+            try std.testing.expectEqual(buf.len, req.raw_bytes_consumed);
+            try std.testing.expect(req.keep_alive);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "tryParse: POST with body" {
+    const allocator = std.testing.allocator;
+    var recycler = ChunkRecycler.init(allocator);
+    defer recycler.deinit();
+
+    const first_chunk = try allocator.create(chunk_pool.Chunk);
+    defer allocator.destroy(first_chunk);
+
+    const config = ArenaConfig.defaults();
+    var arena = RequestArena.init(first_chunk, &recycler, config);
+    defer arena.reset();
+
+    const buf = "POST /submit HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello";
+    const result = tryParse(buf, 32768, 1_048_576, &arena);
+    switch (result) {
+        .complete => |req| {
+            try std.testing.expectEqual(http.Method.post, req.method);
+            try std.testing.expectEqualStrings("/submit", req.path);
+            try std.testing.expectEqualStrings("hello", req.body);
+            try std.testing.expectEqual(buf.len, req.raw_bytes_consumed);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "tryParse: incomplete request" {
+    const allocator = std.testing.allocator;
+    var recycler = ChunkRecycler.init(allocator);
+    defer recycler.deinit();
+
+    const first_chunk = try allocator.create(chunk_pool.Chunk);
+    defer allocator.destroy(first_chunk);
+
+    const config = ArenaConfig.defaults();
+    var arena = RequestArena.init(first_chunk, &recycler, config);
+    defer arena.reset();
+
+    const buf = "GET /path HTTP/1.1\r\nHost: local";
+    const result = tryParse(buf, 32768, 1_048_576, &arena);
+    try std.testing.expectEqual(ParseResult.incomplete, result);
+}
+
+test "tryParse: header_too_large" {
+    const allocator = std.testing.allocator;
+    var recycler = ChunkRecycler.init(allocator);
+    defer recycler.deinit();
+
+    const first_chunk = try allocator.create(chunk_pool.Chunk);
+    defer allocator.destroy(first_chunk);
+
+    const config = ArenaConfig.defaults();
+    var arena = RequestArena.init(first_chunk, &recycler, config);
+    defer arena.reset();
+
+    // A simple request with small headers, but we set max_header_size very low
+    const buf = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    const result = tryParse(buf, 10, 1_048_576, &arena); // max_header_size=10
+    try std.testing.expectEqual(ParseResult.header_too_large, result);
+}
+
+test "tryParse: body_too_large" {
+    const allocator = std.testing.allocator;
+    var recycler = ChunkRecycler.init(allocator);
+    defer recycler.deinit();
+
+    const first_chunk = try allocator.create(chunk_pool.Chunk);
+    defer allocator.destroy(first_chunk);
+
+    const config = ArenaConfig.defaults();
+    var arena = RequestArena.init(first_chunk, &recycler, config);
+    defer arena.reset();
+
+    const buf = "POST / HTTP/1.1\r\nContent-Length: 100\r\n\r\n" ++ "x" ** 100;
+    const result = tryParse(buf, 32768, 50, &arena); // max_body_size=50
+    try std.testing.expectEqual(ParseResult.body_too_large, result);
+}
+
+test "tryParse: zero-length body (no Content-Length)" {
+    const allocator = std.testing.allocator;
+    var recycler = ChunkRecycler.init(allocator);
+    defer recycler.deinit();
+
+    const first_chunk = try allocator.create(chunk_pool.Chunk);
+    defer allocator.destroy(first_chunk);
+
+    const config = ArenaConfig.defaults();
+    var arena = RequestArena.init(first_chunk, &recycler, config);
+    defer arena.reset();
+
+    const buf = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    const result = tryParse(buf, 32768, 1_048_576, &arena);
+    switch (result) {
+        .complete => |req| {
+            try std.testing.expectEqualStrings("", req.body);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "tryParse: Content-Length: 0" {
+    const allocator = std.testing.allocator;
+    var recycler = ChunkRecycler.init(allocator);
+    defer recycler.deinit();
+
+    const first_chunk = try allocator.create(chunk_pool.Chunk);
+    defer allocator.destroy(first_chunk);
+
+    const config = ArenaConfig.defaults();
+    var arena = RequestArena.init(first_chunk, &recycler, config);
+    defer arena.reset();
+
+    const buf = "POST / HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
+    const result = tryParse(buf, 32768, 1_048_576, &arena);
+    switch (result) {
+        .complete => |req| {
+            try std.testing.expectEqualStrings("", req.body);
+            try std.testing.expectEqual(@as(usize, 0), req.body.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "tryParse: invalid Content-Length" {
+    const allocator = std.testing.allocator;
+    var recycler = ChunkRecycler.init(allocator);
+    defer recycler.deinit();
+
+    const first_chunk = try allocator.create(chunk_pool.Chunk);
+    defer allocator.destroy(first_chunk);
+
+    const config = ArenaConfig.defaults();
+    var arena = RequestArena.init(first_chunk, &recycler, config);
+    defer arena.reset();
+
+    const buf = "POST / HTTP/1.1\r\nContent-Length: abc\r\n\r\n";
+    const result = tryParse(buf, 32768, 1_048_576, &arena);
+    try std.testing.expectEqual(ParseResult.invalid, result);
+}
+
+test "tryParse: duplicate headers preserved" {
+    const allocator = std.testing.allocator;
+    var recycler = ChunkRecycler.init(allocator);
+    defer recycler.deinit();
+
+    const first_chunk = try allocator.create(chunk_pool.Chunk);
+    defer allocator.destroy(first_chunk);
+
+    const config = ArenaConfig.defaults();
+    var arena = RequestArena.init(first_chunk, &recycler, config);
+    defer arena.reset();
+
+    const buf = "GET / HTTP/1.1\r\nHost: localhost\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\n\r\n";
+    const result = tryParse(buf, 32768, 1_048_576, &arena);
+    switch (result) {
+        .complete => |req| {
+            try std.testing.expectEqual(@as(usize, 3), req.headers.len);
+            try std.testing.expectEqualStrings("Host", req.headers[0].key);
+            try std.testing.expectEqualStrings("Set-Cookie", req.headers[1].key);
+            try std.testing.expectEqualStrings("a=1", req.headers[1].value);
+            try std.testing.expectEqualStrings("Set-Cookie", req.headers[2].key);
+            try std.testing.expectEqualStrings("b=2", req.headers[2].value);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "tryParse: Connection close means not keep-alive" {
+    const allocator = std.testing.allocator;
+    var recycler = ChunkRecycler.init(allocator);
+    defer recycler.deinit();
+
+    const first_chunk = try allocator.create(chunk_pool.Chunk);
+    defer allocator.destroy(first_chunk);
+
+    const config = ArenaConfig.defaults();
+    var arena = RequestArena.init(first_chunk, &recycler, config);
+    defer arena.reset();
+
+    const buf = "GET / HTTP/1.1\r\nConnection: close\r\n\r\n";
+    const result = tryParse(buf, 32768, 1_048_576, &arena);
+    switch (result) {
+        .complete => |req| {
+            try std.testing.expect(!req.keep_alive);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "tryParse: HTTP/1.0 default not keep-alive" {
+    const allocator = std.testing.allocator;
+    var recycler = ChunkRecycler.init(allocator);
+    defer recycler.deinit();
+
+    const first_chunk = try allocator.create(chunk_pool.Chunk);
+    defer allocator.destroy(first_chunk);
+
+    const config = ArenaConfig.defaults();
+    var arena = RequestArena.init(first_chunk, &recycler, config);
+    defer arena.reset();
+
+    const buf = "GET / HTTP/1.0\r\nHost: localhost\r\n\r\n";
+    const result = tryParse(buf, 32768, 1_048_576, &arena);
+    switch (result) {
+        .complete => |req| {
+            try std.testing.expect(!req.keep_alive);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "tryParse: incomplete body (Content-Length present but body not fully received)" {
+    const allocator = std.testing.allocator;
+    var recycler = ChunkRecycler.init(allocator);
+    defer recycler.deinit();
+
+    const first_chunk = try allocator.create(chunk_pool.Chunk);
+    defer allocator.destroy(first_chunk);
+
+    const config = ArenaConfig.defaults();
+    var arena = RequestArena.init(first_chunk, &recycler, config);
+    defer arena.reset();
+
+    const buf = "POST / HTTP/1.1\r\nContent-Length: 10\r\n\r\nhello";
+    const result = tryParse(buf, 32768, 1_048_576, &arena);
+    try std.testing.expectEqual(ParseResult.incomplete, result);
+}
+
+test "tryParse: pipelined requests" {
+    const allocator = std.testing.allocator;
+    var recycler = ChunkRecycler.init(allocator);
+    defer recycler.deinit();
+
+    const first_chunk = try allocator.create(chunk_pool.Chunk);
+    defer allocator.destroy(first_chunk);
+
+    const config = ArenaConfig.defaults();
+    var arena = RequestArena.init(first_chunk, &recycler, config);
+
+    const buf = "GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n";
+
+    // Parse first request
+    const result1 = tryParse(buf, 32768, 1_048_576, &arena);
+    switch (result1) {
+        .complete => |req| {
+            try std.testing.expectEqualStrings("/a", req.path);
+            // Parse second request from remaining bytes
+            arena.reset();
+            const remaining = buf[req.raw_bytes_consumed..];
+            const result2 = tryParse(remaining, 32768, 1_048_576, &arena);
+            switch (result2) {
+                .complete => |req2| {
+                    try std.testing.expectEqualStrings("/b", req2.path);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    arena.reset();
+}
+
+test "allocSlice: basic typed allocation" {
+    const allocator = std.testing.allocator;
+    var recycler = ChunkRecycler.init(allocator);
+    defer recycler.deinit();
+
+    const first_chunk = try allocator.create(chunk_pool.Chunk);
+    defer allocator.destroy(first_chunk);
+
+    const config = ArenaConfig.defaults();
+    var arena = RequestArena.init(first_chunk, &recycler, config);
+    defer arena.reset();
+
+    const headers = arena.allocSlice(http.Header, 32) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 32), headers.len);
+
+    // Write to verify memory is valid
+    headers[0] = .{ .key = "Host", .value = "localhost" };
+    headers[31] = .{ .key = "X-Last", .value = "yes" };
+    try std.testing.expectEqualStrings("Host", headers[0].key);
+    try std.testing.expectEqualStrings("X-Last", headers[31].key);
 }

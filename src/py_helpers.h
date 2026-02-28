@@ -48,6 +48,7 @@ int py_helper_greenlet_main(PyObject *greenlet);
 /* Tuple helpers */
 PyObject *py_helper_tuple_new(Py_ssize_t size);
 int py_helper_tuple_setitem(PyObject *tuple, Py_ssize_t pos, PyObject *item);
+PyObject *py_helper_tuple_getitem(PyObject *tuple, Py_ssize_t pos);
 
 /* Error handling */
 PyObject *py_helper_err_occurred(void);

@@ -188,7 +188,7 @@ fn runHub(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
 // sentinels and flag constants come from extern C helpers)
 // ---------------------------------------------------------------------------
 
-var methods: [23]PyMethodDef = undefined;
+var methods: [25]PyMethodDef = undefined;
 var module_def: PyModuleDef = undefined;
 
 // ---------------------------------------------------------------------------
@@ -331,7 +331,19 @@ pub export fn PyInit__framework_core() callconv(.c) ?*PyObject {
         .ml_flags = py.py_helper_meth_varargs(),
         .ml_doc = "Wait for fd readiness with timeout via POLL_ADD + LINK_TIMEOUT. Returns revents or 0 on timeout.",
     };
-    methods[22] = py.py_helper_method_sentinel();
+    methods[22] = .{
+        .ml_name = "http_read_request",
+        .ml_meth = @ptrCast(&hub.pyHttpReadRequest),
+        .ml_flags = py.py_helper_meth_varargs(),
+        .ml_doc = "Read and parse one HTTP request from fd. Returns (method, path, body, keep_alive, headers) or None on EOF.",
+    };
+    methods[23] = .{
+        .ml_name = "http_format_response_full",
+        .ml_meth = @ptrCast(&hub.pyHttpFormatResponseFull),
+        .ml_flags = py.py_helper_meth_varargs(),
+        .ml_doc = "Format a full HTTP response with headers. Returns complete response bytes.",
+    };
+    methods[24] = py.py_helper_method_sentinel();
 
     module_def = .{
         .m_base = py.py_helper_module_def_head_init(),

@@ -58,18 +58,18 @@ class Response:
         self._finalized = True
 
         body = b"".join(self._body_parts)
-        reason = _REASON_PHRASES.get(self.status, "Unknown")
 
-        # Build response
-        parts: list[str] = [f"HTTP/1.1 {self.status} {reason}\r\n"]
-
-        # Set Content-Length if not already set
-        if "Content-Length" not in self._headers:
-            self._headers["Content-Length"] = str(len(body))
-
+        # Format headers as list of (bytes, bytes) for Zig.
+        # Content-Length is NOT included here because writeResponse()
+        # in Zig always auto-generates it from the body length.
+        header_pairs: list[tuple[bytes, bytes]] = []
         for name, value in self._headers.items():
-            parts.append(f"{name}: {value}\r\n")
-        parts.append("\r\n")
+            if name == "Content-Length":
+                continue
+            header_pairs.append((name.encode("latin-1"), value.encode("latin-1")))
 
-        raw = "".join(parts).encode("latin-1") + body
+        # Single Zig call: formats status line + headers + body
+        raw = _framework_core.http_format_response_full(
+            self.status, header_pairs, body,
+        )
         _framework_core.green_send(self._fd, raw)

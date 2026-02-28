@@ -7,7 +7,10 @@ import urllib.parse
 class Request:
     """HTTP request object parsed from raw bytes."""
 
-    __slots__ = ("method", "path", "full_path", "query_params", "headers", "body", "params")
+    __slots__ = (
+        "method", "path", "full_path", "query_params",
+        "headers", "body", "params", "_raw_headers",
+    )
 
     method: str
     path: str
@@ -34,6 +37,7 @@ class Request:
         self.headers = headers
         self.body = body
         self.params = {}
+        self._raw_headers: list[tuple[bytes, bytes]] = []
 
     @classmethod
     def _from_raw(
@@ -72,6 +76,52 @@ class Request:
             headers=headers,
             body=body,
         )
+
+    @classmethod
+    def _from_parsed(
+        cls,
+        method: str,
+        path: str,
+        body: bytes,
+        headers: list[tuple[bytes, bytes]],
+    ) -> Request:
+        """Build Request from Zig-parsed fields. No re-parsing."""
+        # Convert headers list to dict (last value wins, backward compat)
+        headers_dict: dict[str, str] = {}
+        for key_bytes, val_bytes in headers:
+            headers_dict[key_bytes.decode("latin-1").lower()] = (
+                val_bytes.decode("latin-1")
+            )
+
+        # Split path and query string
+        full_path = path
+        if "?" in path:
+            path_part, _, qs = path.partition("?")
+            query_params = {
+                k: v[0] for k, v in urllib.parse.parse_qs(qs).items()
+            }
+        else:
+            path_part = path
+            query_params = {}
+
+        req = cls.__new__(cls)
+        req.method = method
+        req.path = path_part
+        req.full_path = full_path
+        req.query_params = query_params
+        req.headers = headers_dict
+        req.body = body
+        req.params = {}
+        req._raw_headers = headers  # preserve for duplicate access
+        return req
+
+    @property
+    def raw_headers(self) -> list[tuple[bytes, bytes]]:
+        """Headers as ordered list of (name, value) byte pairs.
+
+        Preserves duplicates (e.g. multiple Set-Cookie).
+        """
+        return self._raw_headers
 
     def json(self) -> object:
         """Parse body as JSON."""

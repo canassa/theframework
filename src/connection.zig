@@ -7,6 +7,9 @@ const Chunk = chunk_pool.Chunk;
 const ChunkRecycler = chunk_pool.ChunkRecycler;
 const config_mod = @import("config.zig");
 const ArenaConfig = config_mod.ArenaConfig;
+const input_buffer_mod = @import("input_buffer.zig");
+const InputBuffer = input_buffer_mod.InputBuffer;
+const BufferRecycler = @import("buffer_recycler.zig").BufferRecycler;
 
 // ---------------------------------------------------------------------------
 // Connection
@@ -33,6 +36,10 @@ pub const Connection = struct {
     arena: RequestArena,
     inline_chunk: Chunk, // 4 KB embedded, used as arena's first_chunk
 
+    // Per-connection input buffer for zero-copy recv accumulation
+    input: InputBuffer,
+    inline_buf: [input_buffer_mod.INLINE_BUF_SIZE]u8, // 4 KB embedded
+
     pub fn reset(self: *Connection) void {
         // Note: caller must decref greenlet before calling reset
         self.fd = -1;
@@ -41,6 +48,7 @@ pub const Connection = struct {
         self.pending_ops = 0;
         self.result = 0;
         self.arena.reset();
+        self.input.resetForNewConnection(&self.inline_buf, input_buffer_mod.INLINE_BUF_SIZE);
     }
 };
 
@@ -73,6 +81,7 @@ pub const ConnectionPool = struct {
         allocator: std.mem.Allocator,
         config: ArenaConfig,
         recycler: *ChunkRecycler,
+        buf_recycler: *BufferRecycler,
     ) !ConnectionPool {
         const max_conns: usize = config.max_connections;
         const connections = try allocator.alloc(Connection, max_conns);
@@ -91,11 +100,18 @@ pub const ConnectionPool = struct {
                 .result = 0,
                 .inline_chunk = undefined,
                 .arena = undefined,
+                .inline_buf = undefined,
+                .input = undefined,
             };
             connections[i].arena = RequestArena.init(
                 &connections[i].inline_chunk,
                 recycler,
                 config,
+            );
+            connections[i].input = InputBuffer.init(
+                &connections[i].inline_buf,
+                input_buffer_mod.INLINE_BUF_SIZE,
+                buf_recycler,
             );
         }
 
@@ -118,8 +134,10 @@ pub const ConnectionPool = struct {
     pub fn deinit(self: *ConnectionPool) void {
         // Note: caller must decref any remaining greenlets before deinit
         // Reset all arenas to return chunks to recycler and free directs
+        // Reset all input buffers to return buffers to recycler
         for (self.connections) |*conn| {
             conn.arena.reset();
+            conn.input.resetForNewConnection(&conn.inline_buf, input_buffer_mod.INLINE_BUF_SIZE);
         }
         self.allocator.free(self.connections);
         self.free_list.deinit(self.allocator);
@@ -170,6 +188,15 @@ pub const ConnectionPool = struct {
         }
     }
 
+    /// Fix up all InputBuffer recycler pointers to point to the given BufferRecycler.
+    /// Must be called after the Hub is placed at its final address (same reason
+    /// as fixupRecycler for the ChunkRecycler).
+    pub fn fixupBufRecycler(self: *ConnectionPool, buf_recycler: *BufferRecycler) void {
+        for (self.connections) |*conn| {
+            conn.input.recycler = buf_recycler;
+        }
+    }
+
     /// How many connections are currently in use.
     pub fn activeCount(self: *ConnectionPool) usize {
         return self.connections.len - self.free_list.items.len;
@@ -202,9 +229,12 @@ test "ConnectionPool acquire and release" {
     var recycler = ChunkRecycler.init(allocator);
     defer recycler.deinit();
 
+    var buf_recycler = BufferRecycler.init(allocator);
+    defer buf_recycler.deinit();
+
     var config = ArenaConfig.defaults();
     config.max_connections = 64; // small pool for testing
-    var pool = try ConnectionPool.init(allocator, config, &recycler);
+    var pool = try ConnectionPool.init(allocator, config, &recycler, &buf_recycler);
     defer pool.deinit();
 
     // All slots should be free initially
@@ -236,9 +266,12 @@ test "ConnectionPool acquire N, release all, acquire N again" {
     var recycler = ChunkRecycler.init(allocator);
     defer recycler.deinit();
 
+    var buf_recycler = BufferRecycler.init(allocator);
+    defer buf_recycler.deinit();
+
     var config = ArenaConfig.defaults();
     config.max_connections = 64;
-    var pool = try ConnectionPool.init(allocator, config, &recycler);
+    var pool = try ConnectionPool.init(allocator, config, &recycler, &buf_recycler);
     defer pool.deinit();
 
     const N = 50;
@@ -287,9 +320,12 @@ test "ConnectionPool lookup validates generation" {
     var recycler = ChunkRecycler.init(allocator);
     defer recycler.deinit();
 
+    var buf_recycler = BufferRecycler.init(allocator);
+    defer buf_recycler.deinit();
+
     var config = ArenaConfig.defaults();
     config.max_connections = 64;
-    var pool = try ConnectionPool.init(allocator, config, &recycler);
+    var pool = try ConnectionPool.init(allocator, config, &recycler, &buf_recycler);
     defer pool.deinit();
 
     // Acquire a connection
@@ -316,9 +352,12 @@ test "ConnectionPool exhaustion" {
     var recycler = ChunkRecycler.init(allocator);
     defer recycler.deinit();
 
+    var buf_recycler = BufferRecycler.init(allocator);
+    defer buf_recycler.deinit();
+
     var config = ArenaConfig.defaults();
     config.max_connections = 8; // tiny pool
-    var pool = try ConnectionPool.init(allocator, config, &recycler);
+    var pool = try ConnectionPool.init(allocator, config, &recycler, &buf_recycler);
     defer pool.deinit();
 
     // Exhaust all slots
@@ -336,9 +375,12 @@ test "Connection arena integration: alloc, reset, reuse" {
     var recycler = ChunkRecycler.init(allocator);
     defer recycler.deinit();
 
+    var buf_recycler = BufferRecycler.init(allocator);
+    defer buf_recycler.deinit();
+
     var config = ArenaConfig.defaults();
     config.max_connections = 4;
-    var pool = try ConnectionPool.init(allocator, config, &recycler);
+    var pool = try ConnectionPool.init(allocator, config, &recycler, &buf_recycler);
     defer pool.deinit();
 
     // Acquire a connection

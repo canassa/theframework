@@ -86,85 +86,86 @@ def _create_listen_socket(
 # ---------------------------------------------------------------------------
 
 
+def _try_send_error(fd: int, status_code: int) -> None:
+    """Best-effort error response. Does NOT close the fd (caller's finally does)."""
+    reason = {
+        400: "Bad Request",
+        413: "Payload Too Large",
+        431: "Request Header Fields Too Large",
+        500: "Internal Server Error",
+        503: "Service Unavailable",
+    }
+    body = reason.get(status_code, "Error").encode()
+    resp = (
+        f"HTTP/1.1 {status_code} {reason.get(status_code, 'Error')}\r\n"
+        f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n"
+    ).encode() + body
+    try:
+        _framework_core.green_send(fd, resp)
+    except Exception:
+        pass  # best effort
+
+
+# Keep the old _send_error for backward compatibility (used by external code)
 def _send_error(fd: int, status_code: int) -> None:
     """Send an HTTP error response and close the connection.
 
     Best-effort: if the fd is already closed or the send fails, we just
     swallow the exception and move on.
-    """
-    reason = {
-        413: "Payload Too Large",
-        431: "Request Header Fields Too Large",
-        503: "Service Unavailable",
-    }.get(status_code, "Error")
 
-    response = f"HTTP/1.1 {status_code} {reason}\r\nContent-Length: 0\r\n\r\n".encode()
+    .. deprecated:: Use _try_send_error instead (does not close fd).
+    """
+    _try_send_error(fd, status_code)
     try:
-        _framework_core.green_send(fd, response)
+        _framework_core.green_close(fd)
     except Exception:
-        pass  # Best effort, fd might be closed already
-    finally:
-        try:
-            _framework_core.green_close(fd)
-        except Exception:
-            pass
+        pass
 
 
 def _handle_connection(
     fd: int, handler: HandlerFunc, config: dict[str, int] | None = None,
 ) -> None:
-    """Per-connection greenlet: recv -> parse -> Request/Response -> handler -> finalize."""
+    """Per-connection greenlet: recv+parse in Zig, dispatch to handler."""
     cfg = config or {}
     max_header_size = cfg.get("max_header_size", 32768)
     max_body_size = cfg.get("max_body_size", 1_048_576)
-    buf = b""
     try:
         while True:
-            data = _framework_core.green_recv(fd, 8192)
-            if not data:
-                break
-            buf += data
+            result = _framework_core.http_read_request(
+                fd, max_header_size, max_body_size,
+            )
+            if result is None:
+                return  # EOF, finally block closes
 
-            while True:
-                result = _framework_core.http_parse_request(buf)
-                if result is None:
-                    break  # Need more data
+            method, path, body, keep_alive, headers = result
+            request = Request._from_parsed(method, path, body, headers)
+            response = Response(fd)
 
-                method, path, body, consumed, keep_alive = result
-                raw_bytes = buf[:consumed]
-                buf = buf[consumed:]
-
-                # Check header size (consumed bytes minus body = headers + request line)
-                header_bytes = consumed - len(body)
-                if header_bytes > max_header_size:
-                    _send_error(fd, 431)
-                    return
-
-                # Check body size
-                if len(body) > max_body_size:
-                    _send_error(fd, 413)
-                    return
-
-                request = Request._from_raw(method, path, body, raw_bytes)
-                response = Response(fd)
-
-                handler(request, response)
-                response._finalize()
-
-                if not keep_alive:
-                    _framework_core.green_close(fd)
-                    return
-    except RuntimeError as e:
-        # Arena exhaustion (request too large for configured limits)
-        if "arena exhausted" in str(e) or "too large" in str(e):
             try:
-                _send_error(fd, 413)
+                handler(request, response)
             except Exception:
-                pass
-            return
-        raise
+                # Send 500 if response not yet sent
+                if not response._finalized:
+                    _try_send_error(fd, 500)
+                return
+
+            response._finalize()
+
+            if not keep_alive:
+                return  # finally block closes
+
+    except ValueError:
+        _try_send_error(fd, 400)  # malformed request
+    except RuntimeError as e:
+        msg = str(e)
+        if "header too large" in msg:
+            _try_send_error(fd, 431)
+        elif "too large" in msg:
+            _try_send_error(fd, 413)
+        else:
+            raise
     except OSError:
-        pass
+        pass  # network error, just close
     finally:
         try:
             _framework_core.green_close(fd)
