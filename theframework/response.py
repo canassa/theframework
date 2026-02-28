@@ -70,5 +70,8 @@ class Response:
 
         # Single Zig call: formats headers in arena + writev (zero-copy body)
         _framework_core.http_send_response(
-            self._fd, self.status, header_pairs, body,
+            self._fd,
+            self.status,
+            header_pairs,
+            body,
         )

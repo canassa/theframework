@@ -44,7 +44,9 @@ def _create_listen_socket() -> socket.socket:
     return sock
 
 
-def _run_acceptor(listen_fd: int, handler: HandlerFunc, config: dict[str, int] | None = None) -> None:
+def _run_acceptor(
+    listen_fd: int, handler: HandlerFunc, config: dict[str, int] | None = None
+) -> None:
     while True:
         try:
             client_fd = _framework_core.green_accept(listen_fd)
@@ -58,7 +60,9 @@ def _run_acceptor(listen_fd: int, handler: HandlerFunc, config: dict[str, int] |
         _framework_core.hub_schedule(g)
 
 
-def _start_server(handler: HandlerFunc, config: dict[str, int] | None = None) -> Generator[socket.socket]:
+def _start_server(
+    handler: HandlerFunc, config: dict[str, int] | None = None
+) -> Generator[socket.socket]:
     sock = _create_listen_socket()
     listen_fd = sock.fileno()
     ready = threading.Event()
@@ -81,7 +85,9 @@ def _start_server(handler: HandlerFunc, config: dict[str, int] | None = None) ->
     sock.close()
 
 
-def _start_app_server(app: Framework, config: dict[str, int] | None = None) -> Generator[socket.socket]:
+def _start_app_server(
+    app: Framework, config: dict[str, int] | None = None
+) -> Generator[socket.socket]:
     handler = app._make_handler()
     yield from _start_server(handler, config)
 
@@ -108,7 +114,7 @@ def _recv_response(sock: socket.socket, timeout: float = 3.0) -> bytes:
             if not chunk:
                 return response
             response += chunk
-    except (TimeoutError, ConnectionError):
+    except TimeoutError, ConnectionError:
         return response
 
     header_end = response.index(b"\r\n\r\n") + 4
@@ -124,7 +130,7 @@ def _recv_response(sock: socket.socket, timeout: float = 3.0) -> bytes:
     while len(body) < content_length:
         try:
             chunk = sock.recv(content_length - len(body))
-        except (TimeoutError, ConnectionError):
+        except TimeoutError, ConnectionError:
             break
         if not chunk:
             break
@@ -164,7 +170,7 @@ def _get_status_code(response: bytes) -> int | None:
     try:
         status_line = response.split(b"\r\n", 1)[0]
         return int(status_line.split(b" ", 2)[1])
-    except (IndexError, ValueError):
+    except IndexError, ValueError:
         return None
 
 
@@ -289,7 +295,7 @@ class TestMalformedRequests:
             # Server should either return 400 or close the connection
             if response:
                 assert _get_status_code(response) == 400
-        except (ConnectionError, TimeoutError):
+        except ConnectionError, TimeoutError:
             pass  # acceptable — server closed connection
         finally:
             client.close()
@@ -303,7 +309,7 @@ class TestMalformedRequests:
             response = _recv_response(client, timeout=2.0)
             # Server should close cleanly — no response is acceptable
             assert response == b"" or _get_status_code(response) == 400
-        except (ConnectionError, TimeoutError):
+        except ConnectionError, TimeoutError:
             pass
         finally:
             client.close()
@@ -317,7 +323,7 @@ class TestMalformedRequests:
             response = _recv_response(client, timeout=2.0)
             if response:
                 assert _get_status_code(response) == 400
-        except (ConnectionError, TimeoutError):
+        except ConnectionError, TimeoutError:
             pass
         finally:
             client.close()
@@ -333,7 +339,7 @@ class TestMalformedRequests:
             assert status is not None
             # Either 200 (accepted) or 400 (missing Host) are acceptable
             assert status in (200, 400)
-        except (ConnectionError, TimeoutError):
+        except ConnectionError, TimeoutError:
             pass
         finally:
             client.close()
@@ -347,7 +353,7 @@ class TestMalformedRequests:
             if response:
                 status = _get_status_code(response)
                 assert status in (None, 400)
-        except (ConnectionError, TimeoutError):
+        except ConnectionError, TimeoutError:
             pass
         finally:
             client.close()
@@ -361,7 +367,7 @@ class TestMalformedRequests:
             if response:
                 status = _get_status_code(response)
                 assert status is not None
-        except (ConnectionError, TimeoutError):
+        except ConnectionError, TimeoutError:
             pass
         finally:
             client.close()
@@ -375,7 +381,7 @@ class TestMalformedRequests:
                 status = _get_status_code(response)
                 # Should reject or handle safely
                 assert status is not None
-        except (ConnectionError, TimeoutError):
+        except ConnectionError, TimeoutError:
             pass
         finally:
             client.close()
@@ -389,7 +395,7 @@ class TestMalformedRequests:
             if response:
                 status = _get_status_code(response)
                 assert status is not None
-        except (ConnectionError, TimeoutError):
+        except ConnectionError, TimeoutError:
             pass
         finally:
             client.close()
@@ -402,7 +408,7 @@ class TestMalformedRequests:
             if response:
                 status = _get_status_code(response)
                 assert status is not None
-        except (ConnectionError, TimeoutError):
+        except ConnectionError, TimeoutError:
             pass
         finally:
             client.close()
@@ -416,7 +422,7 @@ class TestMalformedRequests:
             status = _get_status_code(response)
             assert status is not None
             # Should succeed or reject with 414 or 431
-        except (ConnectionError, TimeoutError):
+        except ConnectionError, TimeoutError:
             pass
         finally:
             client.close()
@@ -429,7 +435,7 @@ class TestMalformedRequests:
             if response:
                 status = _get_status_code(response)
                 assert status in (None, 400, 200, 505)
-        except (ConnectionError, TimeoutError):
+        except ConnectionError, TimeoutError:
             pass
         finally:
             client.close()
@@ -444,7 +450,7 @@ class TestMalformedRequests:
             time.sleep(0.1)
             remaining = client.recv(4096)
             assert remaining == b""
-        except (ConnectionError, TimeoutError):
+        except ConnectionError, TimeoutError:
             pass
         finally:
             client.close()
@@ -458,7 +464,7 @@ class TestMalformedRequests:
                 status = _get_status_code(response)
                 # Should either handle it or reject it
                 assert status is not None
-        except (ConnectionError, TimeoutError):
+        except ConnectionError, TimeoutError:
             pass
         finally:
             client.close()
@@ -470,7 +476,7 @@ class TestMalformedRequests:
         try:
             client1.sendall(b"\xff\xfe\xfd\x00\x01\x02")
             client1.close()
-        except (ConnectionError, TimeoutError):
+        except ConnectionError, TimeoutError:
             pass
 
         time.sleep(0.2)
@@ -500,7 +506,7 @@ class TestHeaderManipulation:
             response = _send_raw(client, raw)
             status = _get_status_code(response)
             assert status is not None
-        except (ConnectionError, TimeoutError):
+        except ConnectionError, TimeoutError:
             pass
         finally:
             client.close()
@@ -514,7 +520,7 @@ class TestHeaderManipulation:
             if response:
                 status = _get_status_code(response)
                 assert status in (200, 400)
-        except (ConnectionError, TimeoutError):
+        except ConnectionError, TimeoutError:
             pass
         finally:
             client.close()
@@ -528,7 +534,7 @@ class TestHeaderManipulation:
             if response:
                 status = _get_status_code(response)
                 assert status in (200, 400)
-        except (ConnectionError, TimeoutError):
+        except ConnectionError, TimeoutError:
             pass
         finally:
             client.close()
@@ -542,7 +548,7 @@ class TestHeaderManipulation:
             if response:
                 status = _get_status_code(response)
                 assert status is not None
-        except (ConnectionError, TimeoutError):
+        except ConnectionError, TimeoutError:
             pass
         finally:
             client.close()
@@ -553,16 +559,13 @@ class TestHeaderManipulation:
         try:
             # Attempt to inject a second header via CRLF in the value
             raw = (
-                b"GET / HTTP/1.1\r\n"
-                b"Host: localhost\r\n"
-                b"X-Inject: value\r\nX-Injected: evil\r\n"
-                b"\r\n"
+                b"GET / HTTP/1.1\r\nHost: localhost\r\nX-Inject: value\r\nX-Injected: evil\r\n\r\n"
             )
             response = _send_raw(client, raw)
             if response:
                 status = _get_status_code(response)
                 assert status is not None
-        except (ConnectionError, TimeoutError):
+        except ConnectionError, TimeoutError:
             pass
         finally:
             client.close()
@@ -645,12 +648,7 @@ class TestHeaderManipulation:
         """Multiple Host headers — potential virtual host confusion."""
         client = _connect(server)
         try:
-            raw = (
-                b"GET / HTTP/1.1\r\n"
-                b"Host: legitimate.com\r\n"
-                b"Host: evil.com\r\n"
-                b"\r\n"
-            )
+            raw = b"GET / HTTP/1.1\r\nHost: legitimate.com\r\nHost: evil.com\r\n\r\n"
             response = _send_raw(client, raw)
             status = _get_status_code(response)
             assert status is not None
@@ -669,7 +667,10 @@ class TestHeaderManipulation:
         try:
             long_val = "A" * 16000
             response = _send_http_request(
-                client, "GET", "/", headers={"X-Long": long_val},
+                client,
+                "GET",
+                "/",
+                headers={"X-Long": long_val},
             )
             assert response.startswith(b"HTTP/1.1 200 OK\r\n")
         finally:
@@ -767,14 +768,14 @@ class TestContentLengthAttacks:
             while True:
                 try:
                     chunk = client.recv(8192)
-                except (TimeoutError, ConnectionError):
+                except TimeoutError, ConnectionError:
                     break
                 if not chunk:
                     break
                 all_data += chunk
             assert all_data.startswith(b"HTTP/1.1 200 OK\r\n")
             assert b'"body_len": 0' in all_data
-        except (ConnectionError, TimeoutError):
+        except ConnectionError, TimeoutError:
             pass
         finally:
             client.close()
@@ -786,13 +787,7 @@ class TestContentLengthAttacks:
         """
         client = _connect(ok_server)
         try:
-            raw = (
-                b"POST / HTTP/1.1\r\n"
-                b"Host: localhost\r\n"
-                b"Content-Length: 10000\r\n"
-                b"\r\n"
-                b"short"
-            )
+            raw = b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10000\r\n\r\nshort"
             client.sendall(raw)
             client.shutdown(socket.SHUT_WR)
             response = _recv_response(client, timeout=3.0)
@@ -800,7 +795,7 @@ class TestContentLengthAttacks:
                 status = _get_status_code(response)
                 # Should be 400 (incomplete body) or connection closed
                 assert status in (None, 400)
-        except (ConnectionError, TimeoutError):
+        except ConnectionError, TimeoutError:
             pass
         finally:
             client.close()
@@ -809,17 +804,12 @@ class TestContentLengthAttacks:
         """Negative Content-Length value."""
         client = _connect(ok_server)
         try:
-            raw = (
-                b"POST / HTTP/1.1\r\n"
-                b"Host: localhost\r\n"
-                b"Content-Length: -1\r\n"
-                b"\r\n"
-            )
+            raw = b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: -1\r\n\r\n"
             response = _send_raw(client, raw)
             if response:
                 status = _get_status_code(response)
                 assert status == 400
-        except (ConnectionError, TimeoutError):
+        except ConnectionError, TimeoutError:
             pass
         finally:
             client.close()
@@ -828,17 +818,12 @@ class TestContentLengthAttacks:
         """Non-numeric Content-Length value."""
         client = _connect(ok_server)
         try:
-            raw = (
-                b"POST / HTTP/1.1\r\n"
-                b"Host: localhost\r\n"
-                b"Content-Length: abc\r\n"
-                b"\r\n"
-            )
+            raw = b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: abc\r\n\r\n"
             response = _send_raw(client, raw)
             if response:
                 status = _get_status_code(response)
                 assert status == 400
-        except (ConnectionError, TimeoutError):
+        except ConnectionError, TimeoutError:
             pass
         finally:
             client.close()
@@ -847,18 +832,13 @@ class TestContentLengthAttacks:
         """Content-Length as hex value (0x10)."""
         client = _connect(ok_server)
         try:
-            raw = (
-                b"POST / HTTP/1.1\r\n"
-                b"Host: localhost\r\n"
-                b"Content-Length: 0x10\r\n"
-                b"\r\n"
-            )
+            raw = b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0x10\r\n\r\n"
             response = _send_raw(client, raw)
             if response:
                 status = _get_status_code(response)
                 # Should reject — only decimal is valid
                 assert status == 400
-        except (ConnectionError, TimeoutError):
+        except ConnectionError, TimeoutError:
             pass
         finally:
             client.close()
@@ -867,13 +847,7 @@ class TestContentLengthAttacks:
         """Content-Length with leading zeros (e.g., 005)."""
         client = _connect(server)
         try:
-            raw = (
-                b"POST / HTTP/1.1\r\n"
-                b"Host: localhost\r\n"
-                b"Content-Length: 005\r\n"
-                b"\r\n"
-                b"hello"
-            )
+            raw = b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 005\r\n\r\nhello"
             response = _send_raw(client, raw)
             if response:
                 status = _get_status_code(response)
@@ -889,13 +863,7 @@ class TestContentLengthAttacks:
         """Content-Length with leading/trailing whitespace."""
         client = _connect(server)
         try:
-            raw = (
-                b"POST / HTTP/1.1\r\n"
-                b"Host: localhost\r\n"
-                b"Content-Length:  5 \r\n"
-                b"\r\n"
-                b"hello"
-            )
+            raw = b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length:  5 \r\n\r\nhello"
             response = _send_raw(client, raw)
             if response:
                 status = _get_status_code(response)
@@ -922,7 +890,7 @@ class TestContentLengthAttacks:
                 status = _get_status_code(response)
                 # Should reject — integer overflow
                 assert status in (400, 413)
-        except (ConnectionError, TimeoutError):
+        except ConnectionError, TimeoutError:
             pass
         finally:
             client.close()
@@ -931,11 +899,7 @@ class TestContentLengthAttacks:
         """POST without Content-Length — body should be empty."""
         client = _connect(server)
         try:
-            raw = (
-                b"POST / HTTP/1.1\r\n"
-                b"Host: localhost\r\n"
-                b"\r\n"
-            )
+            raw = b"POST / HTTP/1.1\r\nHost: localhost\r\n\r\n"
             response = _send_raw(client, raw)
             assert response.startswith(b"HTTP/1.1 200 OK\r\n")
             _, _, body = response.partition(b"\r\n\r\n")
@@ -998,7 +962,10 @@ class TestRequestSizeLimits:
         try:
             big_value = "X" * 600
             response = _send_http_request(
-                client, "GET", "/", headers={"X-Big": big_value},
+                client,
+                "GET",
+                "/",
+                headers={"X-Big": big_value},
             )
             assert b"431" in response
         finally:
@@ -1123,7 +1090,9 @@ class TestPathAndQueryString:
         client = _connect(server)
         try:
             response = _send_http_request(
-                client, "GET", "/?key=%00%01%02&foo=bar%26baz=qux",
+                client,
+                "GET",
+                "/?key=%00%01%02&foo=bar%26baz=qux",
             )
             status = _get_status_code(response)
             assert status is not None
@@ -1149,7 +1118,7 @@ class TestPathAndQueryString:
             if response:
                 status = _get_status_code(response)
                 assert status is not None
-        except (ConnectionError, TimeoutError):
+        except ConnectionError, TimeoutError:
             pass
         finally:
             client.close()
@@ -1211,7 +1180,7 @@ class TestHTTPMethods:
             if response:
                 status = _get_status_code(response)
                 assert status is not None
-        except (ConnectionError, TimeoutError):
+        except ConnectionError, TimeoutError:
             pass
         finally:
             client.close()
@@ -1246,7 +1215,7 @@ class TestHTTPMethods:
                 status = _get_status_code(response)
                 # Should be parsed weirdly or rejected
                 assert status is not None
-        except (ConnectionError, TimeoutError):
+        except ConnectionError, TimeoutError:
             pass
         finally:
             client.close()
@@ -1274,7 +1243,7 @@ class TestPipelining:
             while True:
                 try:
                     chunk = client.recv(8192)
-                except (TimeoutError, ConnectionError):
+                except TimeoutError, ConnectionError:
                     break
                 if not chunk:
                     break
@@ -1297,7 +1266,7 @@ class TestPipelining:
             while True:
                 try:
                     chunk = client.recv(8192)
-                except (TimeoutError, ConnectionError):
+                except TimeoutError, ConnectionError:
                     break
                 if not chunk:
                     break
@@ -1312,10 +1281,7 @@ class TestPipelining:
         """First request valid, second request malformed."""
         client = _connect(ok_server)
         try:
-            raw = (
-                b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
-                b"GARBAGE\x00\xff\r\n\r\n"
-            )
+            raw = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\nGARBAGE\x00\xff\r\n\r\n"
             client.sendall(raw)
             resp1 = _recv_response(client)
             assert resp1.startswith(b"HTTP/1.1 200 OK\r\n")
@@ -1324,7 +1290,7 @@ class TestPipelining:
             if resp2:
                 status = _get_status_code(resp2)
                 assert status in (None, 400)
-        except (ConnectionError, TimeoutError):
+        except ConnectionError, TimeoutError:
             pass  # Server may close after bad request
         finally:
             client.close()
@@ -1347,7 +1313,7 @@ class TestPipelining:
             time.sleep(0.2)
             remaining = client.recv(4096)
             assert remaining == b""
-        except (ConnectionError, TimeoutError):
+        except ConnectionError, TimeoutError:
             pass
         finally:
             client.close()
@@ -1373,7 +1339,7 @@ class TestPipelining:
             while True:
                 try:
                     chunk = client.recv(65536)
-                except (TimeoutError, ConnectionError):
+                except TimeoutError, ConnectionError:
                     break
                 if not chunk:
                     break
@@ -1585,7 +1551,9 @@ class TestConnectionLifecycle:
                 client.sendall(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
                 # Set linger to force RST on close
                 client.setsockopt(
-                    socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0),
+                    socket.SOL_SOCKET,
+                    socket.SO_LINGER,
+                    struct.pack("ii", 1, 0),
                 )
             finally:
                 client.close()
@@ -1605,7 +1573,10 @@ class TestConnectionLifecycle:
             client = _connect(ok_server)
             try:
                 response = _send_http_request(
-                    client, "GET", "/", headers={"Connection": "close"},
+                    client,
+                    "GET",
+                    "/",
+                    headers={"Connection": "close"},
                 )
                 assert response.startswith(b"HTTP/1.1 200 OK\r\n")
             finally:
@@ -1622,7 +1593,8 @@ class TestConnectionLifecycle:
             client.close()
 
     def test_connection_pool_exhaustion_and_recovery(
-        self, tiny_pool_server: socket.socket,
+        self,
+        tiny_pool_server: socket.socket,
     ) -> None:
         """Fill connection pool, verify 503, release, verify recovery."""
         clients: list[socket.socket] = []
@@ -1642,7 +1614,7 @@ class TestConnectionLifecycle:
                 response = _recv_response(c5, timeout=2.0)
                 if response:
                     assert b"503" in response
-            except (ConnectionError, TimeoutError):
+            except ConnectionError, TimeoutError:
                 pass
             finally:
                 c5.close()
@@ -1728,7 +1700,7 @@ class TestKeepAlive:
             time.sleep(0.2)
             remaining = client.recv(4096)
             assert remaining == b""  # connection closed
-        except (ConnectionError, TimeoutError):
+        except ConnectionError, TimeoutError:
             pass
         finally:
             client.close()
@@ -1748,7 +1720,7 @@ class TestKeepAlive:
             )
             resp2 = _recv_response(client)
             assert resp2.startswith(b"HTTP/1.1 200 OK\r\n")
-        except (ConnectionError, TimeoutError):
+        except ConnectionError, TimeoutError:
             pass  # some implementations may not honor this
         finally:
             client.close()
@@ -1758,13 +1730,16 @@ class TestKeepAlive:
         client = _connect(ok_server)
         try:
             response = _send_http_request(
-                client, "GET", "/", headers={"Connection": "close"},
+                client,
+                "GET",
+                "/",
+                headers={"Connection": "close"},
             )
             assert response.startswith(b"HTTP/1.1 200 OK\r\n")
             time.sleep(0.2)
             remaining = client.recv(4096)
             assert remaining == b""
-        except (ConnectionError, TimeoutError):
+        except ConnectionError, TimeoutError:
             pass
         finally:
             client.close()
@@ -1774,13 +1749,16 @@ class TestKeepAlive:
         client = _connect(ok_server)
         try:
             response = _send_http_request(
-                client, "GET", "/", headers={"Connection": "CLOSE"},
+                client,
+                "GET",
+                "/",
+                headers={"Connection": "CLOSE"},
             )
             assert response.startswith(b"HTTP/1.1 200 OK\r\n")
             time.sleep(0.2)
             remaining = client.recv(4096)
             assert remaining == b""
-        except (ConnectionError, TimeoutError):
+        except ConnectionError, TimeoutError:
             pass
         finally:
             client.close()
@@ -1799,7 +1777,9 @@ class TestRoutingSecurity:
         client = _connect(crash_server)
         try:
             response = _send_http_request(
-                client, "GET", "/echo",
+                client,
+                "GET",
+                "/echo",
             )
             assert response.startswith(b"HTTP/1.1 200 OK\r\n")
         finally:
@@ -1862,7 +1842,7 @@ class TestBodyParsing:
             try:
                 data = request.json()
                 response.write(json.dumps(data).encode())
-            except (json.JSONDecodeError, ValueError):
+            except json.JSONDecodeError, ValueError:
                 response.set_status(400)
                 response.write(b"Invalid JSON")
 
@@ -1871,7 +1851,9 @@ class TestBodyParsing:
             try:
                 body = b"not valid json {"
                 response = _send_http_request(
-                    client, "POST", "/json",
+                    client,
+                    "POST",
+                    "/json",
                     headers={"Content-Type": "application/json"},
                     body=body,
                 )
@@ -1890,7 +1872,7 @@ class TestBodyParsing:
             try:
                 data = request.json()
                 response.write(json.dumps(data).encode())
-            except (json.JSONDecodeError, ValueError):
+            except json.JSONDecodeError, ValueError:
                 response.set_status(400)
                 response.write(b"Invalid JSON")
 
@@ -1898,7 +1880,9 @@ class TestBodyParsing:
             client = _connect(sock)
             try:
                 response = _send_http_request(
-                    client, "POST", "/json",
+                    client,
+                    "POST",
+                    "/json",
                     headers={"Content-Type": "application/json"},
                     body=b"",
                 )
@@ -1951,19 +1935,13 @@ class TestRequestSmuggling:
         """Obsolete header line folding (RFC 7230 Section 3.2.4)."""
         client = _connect(server)
         try:
-            raw = (
-                b"GET / HTTP/1.1\r\n"
-                b"Host: localhost\r\n"
-                b"X-Folded: first\r\n"
-                b" continuation\r\n"
-                b"\r\n"
-            )
+            raw = b"GET / HTTP/1.1\r\nHost: localhost\r\nX-Folded: first\r\n continuation\r\n\r\n"
             response = _send_raw(client, raw)
             if response:
                 status = _get_status_code(response)
                 # Should handle or reject obsolete folding
                 assert status is not None
-        except (ConnectionError, TimeoutError):
+        except ConnectionError, TimeoutError:
             pass
         finally:
             client.close()
@@ -1983,7 +1961,7 @@ class TestStressAndEdgeCases:
             try:
                 client = _connect(ok_server, timeout=1.0)
                 client.close()
-            except (ConnectionError, TimeoutError):
+            except ConnectionError, TimeoutError:
                 pass
 
         time.sleep(0.3)
@@ -2023,7 +2001,8 @@ class TestStressAndEdgeCases:
             client.close()
 
     def test_interleaved_requests_on_same_connection(
-        self, crash_server: socket.socket,
+        self,
+        crash_server: socket.socket,
     ) -> None:
         """Send request, get 500, then send normal request on same connection.
 
@@ -2042,7 +2021,7 @@ class TestStressAndEdgeCases:
                 if response2:
                     status = _get_status_code(response2)
                     assert status is not None
-            except (ConnectionError, TimeoutError, ValueError):
+            except ConnectionError, TimeoutError, ValueError:
                 pass  # Expected — connection was closed
         finally:
             client.close()

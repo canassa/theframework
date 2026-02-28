@@ -123,7 +123,9 @@ def _send_error(fd: int, status_code: int) -> None:
 
 
 def _handle_connection(
-    fd: int, handler: HandlerFunc, config: dict[str, int] | None = None,
+    fd: int,
+    handler: HandlerFunc,
+    config: dict[str, int] | None = None,
 ) -> None:
     """Per-connection greenlet: recv+parse in Zig, dispatch to handler."""
     cfg = config or {}
@@ -132,7 +134,9 @@ def _handle_connection(
     try:
         while True:
             result = _framework_core.http_read_request(
-                fd, max_header_size, max_body_size,
+                fd,
+                max_header_size,
+                max_body_size,
             )
             if result is None:
                 return  # EOF, finally block closes
@@ -380,6 +384,7 @@ def _supervisor_loop(
     except AttributeError:
         # Python 3.9 doesn't have set_blocking, use fcntl
         import fcntl
+
         fcntl.fcntl(signal_r, fcntl.F_SETFL, os.O_NONBLOCK)
         fcntl.fcntl(signal_w, fcntl.F_SETFL, os.O_NONBLOCK)
 
@@ -441,11 +446,7 @@ def _supervisor_loop(
                     _log(f"worker {worker_id} (pid {pid}) exited with code {exit_code}")
                 elif os.WIFSIGNALED(status):
                     sig = os.WTERMSIG(status)
-                    sig_name = (
-                        signal.Signals(sig).name
-                        if hasattr(signal, "Signals")
-                        else str(sig)
-                    )
+                    sig_name = signal.Signals(sig).name if hasattr(signal, "Signals") else str(sig)
                     _log(f"worker {worker_id} (pid {pid}) killed by signal {sig_name}")
                 else:
                     _log(f"worker {worker_id} (pid {pid}) exited with status {status}")
@@ -535,7 +536,12 @@ def _serve_prefork(
 
         # Enter supervisor loop
         _supervisor_loop(
-            children, handler, host, port, workers, SHUTDOWN_TIMEOUT,
+            children,
+            handler,
+            host,
+            port,
+            workers,
+            SHUTDOWN_TIMEOUT,
             config=config,
         )
     except KeyboardInterrupt:

@@ -129,11 +129,7 @@ def _http_echo_handler(fd: int) -> None:
         return
     method, path, _body, _keep_alive, _headers = result
     body = f"{method} {path}".encode()
-    resp = (
-        b"HTTP/1.1 200 OK\r\n"
-        b"Content-Length: " + str(len(body)).encode() + b"\r\n"
-        b"\r\n" + body
-    )
+    resp = b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
     _framework_core.green_send(fd, resp)
     return
 

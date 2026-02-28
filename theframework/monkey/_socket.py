@@ -370,7 +370,7 @@ class socket(_socket.socket):
                     # on this fd (waking blocked greenlets with errors)
                     # and then closes the fd.
                     _framework_core.green_close(self.fileno())
-                except (RuntimeError, OSError):
+                except RuntimeError, OSError:
                     # If green_close fails (e.g., hub not running),
                     # fall back to regular close.
                     super().close()

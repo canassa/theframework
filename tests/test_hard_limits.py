@@ -37,7 +37,9 @@ def _create_listen_socket() -> socket.socket:
 
 
 def _run_acceptor_with_config(
-    listen_fd: int, handler: HandlerFunc, config: dict[str, int],
+    listen_fd: int,
+    handler: HandlerFunc,
+    config: dict[str, int],
 ) -> None:
     """Accept connections and spawn handler greenlets, passing config."""
     while True:
@@ -54,7 +56,8 @@ def _run_acceptor_with_config(
 
 
 def _start_server_with_config(
-    handler: HandlerFunc, config: dict[str, int],
+    handler: HandlerFunc,
+    config: dict[str, int],
 ) -> Generator[socket.socket]:
     """Start a server with the given handler and config on an ephemeral port."""
     sock = _create_listen_socket()
@@ -220,7 +223,10 @@ def test_request_headers_too_large(small_header_server: socket.socket) -> None:
         # Build request with a large custom header to exceed 128-byte limit
         big_header_value = "x" * 200
         response = _send_http_request(
-            client, "GET", "/", headers={"X-Big": big_header_value},
+            client,
+            "GET",
+            "/",
+            headers={"X-Big": big_header_value},
         )
         assert b"431" in response
     finally:
@@ -265,7 +271,10 @@ def test_server_recovers_after_header_rejection(
     try:
         big_header_value = "x" * 200
         response1 = _send_http_request(
-            client1, "GET", "/", headers={"X-Big": big_header_value},
+            client1,
+            "GET",
+            "/",
+            headers={"X-Big": big_header_value},
         )
         assert b"431" in response1
     finally:
@@ -316,7 +325,7 @@ def test_connection_pool_exhaustion(tiny_pool_server: socket.socket) -> None:
             # closed immediately (empty response)
             if response:
                 assert b"503" in response
-        except (ConnectionError, TimeoutError):
+        except ConnectionError, TimeoutError:
             # Connection was refused or reset — also acceptable
             pass
         finally:

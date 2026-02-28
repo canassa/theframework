@@ -35,7 +35,7 @@ def wait_for_port(host: str, port: int, timeout: float = 5.0) -> None:
         try:
             with socket.create_connection((host, port), timeout=0.1):
                 return
-        except (ConnectionRefusedError, OSError):
+        except ConnectionRefusedError, OSError:
             time.sleep(0.05)
     raise TimeoutError(f"server not ready at {host}:{port} after {timeout}s")
 
@@ -404,7 +404,7 @@ if __name__ == "__main__":
                 sock.sendall(b"GET /hello HTTP/1.1\r\nHost: localhost\r\n\r\n")
                 sock.recv(4096)  # Worker crashes, so this may fail
                 sock.close()
-            except (ConnectionRefusedError, BrokenPipeError, ConnectionResetError):
+            except ConnectionRefusedError, BrokenPipeError, ConnectionResetError:
                 # Expected: worker crashed
                 crash_count += 1
             time.sleep(0.1)  # 10 requests × 0.1s = 1 second total

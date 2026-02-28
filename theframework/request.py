@@ -8,8 +8,14 @@ class Request:
     """HTTP request object parsed from raw bytes."""
 
     __slots__ = (
-        "method", "path", "full_path", "query_params",
-        "headers", "body", "params", "_raw_headers",
+        "method",
+        "path",
+        "full_path",
+        "query_params",
+        "headers",
+        "body",
+        "params",
+        "_raw_headers",
     )
 
     method: str
@@ -89,17 +95,13 @@ class Request:
         # Convert headers list to dict (last value wins, backward compat)
         headers_dict: dict[str, str] = {}
         for key_bytes, val_bytes in headers:
-            headers_dict[key_bytes.decode("latin-1").lower()] = (
-                val_bytes.decode("latin-1")
-            )
+            headers_dict[key_bytes.decode("latin-1").lower()] = val_bytes.decode("latin-1")
 
         # Split path and query string
         full_path = path
         if "?" in path:
             path_part, _, qs = path.partition("?")
-            query_params = {
-                k: v[0] for k, v in urllib.parse.parse_qs(qs).items()
-            }
+            query_params = {k: v[0] for k, v in urllib.parse.parse_qs(qs).items()}
         else:
             path_part = path
             query_params = {}

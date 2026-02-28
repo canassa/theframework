@@ -97,7 +97,7 @@ class CooperativeSelector(_orig_selectors_mod.BaseSelector):
             t = timeout if timeout is not None else None
             try:
                 r, w, _ = _get_original_select(rlist, wlist, [], t if t is not None else -1)
-            except (ValueError, OSError):
+            except ValueError, OSError:
                 return []
             return self._build_results(r, w)
 
