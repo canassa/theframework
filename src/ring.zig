@@ -29,6 +29,16 @@ pub const Ring = struct {
         return try self.io.send(user_data, fd, buf, 0);
     }
 
+    /// Queue a writev (scatter/gather write) operation on a file descriptor.
+    pub fn prepWritev(
+        self: *Ring,
+        fd: posix.fd_t,
+        iovecs: []const posix.iovec_const,
+        user_data: u64,
+    ) !*linux.io_uring_sqe {
+        return try self.io.writev(user_data, fd, iovecs, 0);
+    }
+
     /// Queue a close operation on a file descriptor.
     pub fn prepClose(self: *Ring, fd: posix.fd_t, user_data: u64) !*linux.io_uring_sqe {
         return try self.io.close(user_data, fd);

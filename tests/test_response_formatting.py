@@ -1,4 +1,4 @@
-"""Tests for Phase 3: response formatting in Zig via http_format_response_full."""
+"""Tests for response formatting via http_send_response (zero-copy writev)."""
 
 from __future__ import annotations
 
@@ -20,44 +20,26 @@ from theframework.server import HandlerFunc
 
 
 # ---------------------------------------------------------------------------
-# Unit-level FFI tests (no server needed)
+# Unit-level FFI tests for http_format_response (simple status+body API)
 # ---------------------------------------------------------------------------
 
 
-class TestHttpFormatResponseFull:
-    """Direct tests of _framework_core.http_format_response_full."""
+class TestHttpFormatResponse:
+    """Direct tests of _framework_core.http_format_response (no headers variant)."""
 
     def test_basic_200_with_body(self) -> None:
-        raw = _framework_core.http_format_response_full(200, [], b"hello")
+        raw = _framework_core.http_format_response(200, b"hello")
         assert raw == b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
 
     def test_404_with_body(self) -> None:
-        raw = _framework_core.http_format_response_full(404, [], b"not found")
+        raw = _framework_core.http_format_response(404, b"not found")
         assert raw.startswith(b"HTTP/1.1 404 Not Found\r\n")
         assert b"Content-Length: 9\r\n" in raw
         assert raw.endswith(b"\r\n\r\nnot found")
 
     def test_204_no_content(self) -> None:
-        raw = _framework_core.http_format_response_full(204, [], b"")
+        raw = _framework_core.http_format_response(204, b"")
         assert raw == b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n"
-
-    def test_custom_headers(self) -> None:
-        headers = [
-            (b"Content-Type", b"text/plain"),
-            (b"X-Custom", b"test-value"),
-        ]
-        raw = _framework_core.http_format_response_full(200, headers, b"hi")
-        assert b"Content-Type: text/plain\r\n" in raw
-        assert b"X-Custom: test-value\r\n" in raw
-        assert b"Content-Length: 2\r\n" in raw
-        assert raw.endswith(b"\r\n\r\nhi")
-
-    def test_empty_body_with_headers(self) -> None:
-        headers = [(b"X-Request-Id", b"abc123")]
-        raw = _framework_core.http_format_response_full(200, headers, b"")
-        assert b"X-Request-Id: abc123\r\n" in raw
-        assert b"Content-Length: 0\r\n" in raw
-        assert raw.endswith(b"\r\n\r\n")
 
     def test_status_codes(self) -> None:
         """Verify all supported status codes produce correct status lines."""
@@ -81,41 +63,20 @@ class TestHttpFormatResponseFull:
             504: b"HTTP/1.1 504 Gateway Timeout\r\n",
         }
         for code, expected_line in expected.items():
-            raw = _framework_core.http_format_response_full(code, [], b"")
+            raw = _framework_core.http_format_response(code, b"")
             assert raw.startswith(expected_line), f"Status {code}: {raw!r}"
 
     def test_unsupported_status_code(self) -> None:
         with pytest.raises(ValueError, match="Unsupported HTTP status code"):
-            _framework_core.http_format_response_full(999, [], b"")
-
-    def test_large_body_heap_fallback(self) -> None:
-        """Body > 64 KB should trigger heap fallback and still work."""
-        body = b"X" * 100_000
-        raw = _framework_core.http_format_response_full(200, [], body)
-        assert raw.startswith(b"HTTP/1.1 200 OK\r\n")
-        assert b"Content-Length: 100000\r\n" in raw
-        assert raw.endswith(body)
-
-    def test_many_headers(self) -> None:
-        """More than 64 headers should work (heap allocation path)."""
-        headers = [(f"X-Header-{i}".encode(), f"value-{i}".encode()) for i in range(100)]
-        raw = _framework_core.http_format_response_full(200, headers, b"ok")
-        for i in range(100):
-            assert f"X-Header-{i}: value-{i}\r\n".encode() in raw
-        assert b"Content-Length: 2\r\n" in raw
-
-    def test_latin1_header_values(self) -> None:
-        """Non-ASCII latin-1 bytes in header values should pass through."""
-        # latin-1 character: e-acute = 0xe9
-        headers = [(b"X-Name", b"\xe9t\xe9")]
-        raw = _framework_core.http_format_response_full(200, headers, b"")
-        assert b"X-Name: \xe9t\xe9\r\n" in raw
+            _framework_core.http_format_response(999, b"")
 
     def test_auto_content_length(self) -> None:
         """Content-Length is auto-generated matching body size."""
-        for size in [0, 1, 42, 1000, 65535]:
+        # http_format_response uses a 64 KB stack buffer, so body + headers
+        # must fit within that. Keeping body sizes well below the limit.
+        for size in [0, 1, 42, 1000, 60000]:
             body = b"A" * size
-            raw = _framework_core.http_format_response_full(200, [], body)
+            raw = _framework_core.http_format_response(200, body)
             assert f"Content-Length: {size}\r\n".encode() in raw
 
 
@@ -319,7 +280,7 @@ def test_response_custom_status(response_server: socket.socket) -> None:
 
 
 def test_response_large_body(response_server: socket.socket) -> None:
-    """Response > 64 KB body triggers heap fallback and works correctly."""
+    """Response > 64 KB body works correctly via writev."""
     client = _connect(response_server)
     raw = _send_http_request(client, "GET", "/large-body")
     assert raw.startswith(b"HTTP/1.1 200 OK\r\n")

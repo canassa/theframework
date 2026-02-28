@@ -68,8 +68,7 @@ class Response:
                 continue
             header_pairs.append((name.encode("latin-1"), value.encode("latin-1")))
 
-        # Single Zig call: formats status line + headers + body
-        raw = _framework_core.http_format_response_full(
-            self.status, header_pairs, body,
+        # Single Zig call: formats headers in arena + writev (zero-copy body)
+        _framework_core.http_send_response(
+            self._fd, self.status, header_pairs, body,
         )
-        _framework_core.green_send(self._fd, raw)

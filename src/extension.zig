@@ -338,10 +338,10 @@ pub export fn PyInit__framework_core() callconv(.c) ?*PyObject {
         .ml_doc = "Read and parse one HTTP request from fd. Returns (method, path, body, keep_alive, headers) or None on EOF.",
     };
     methods[23] = .{
-        .ml_name = "http_format_response_full",
-        .ml_meth = @ptrCast(&hub.pyHttpFormatResponseFull),
+        .ml_name = "http_send_response",
+        .ml_meth = @ptrCast(&hub.pyHttpSendResponse),
         .ml_flags = py.py_helper_meth_varargs(),
-        .ml_doc = "Format a full HTTP response with headers. Returns complete response bytes.",
+        .ml_doc = "Format headers and send response via writev. Zero-copy for body.",
     };
     methods[24] = py.py_helper_method_sentinel();
 

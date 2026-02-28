@@ -610,6 +610,142 @@ pub const Hub = struct {
     }
 
     // -----------------------------------------------------------------------
+    // green_send_response: format headers in arena, writev headers + body
+    // -----------------------------------------------------------------------
+
+    /// Format response headers into the arena, then send headers + body
+    /// via a single writev SQE. The body is never copied -- it is sent
+    /// directly from the Python bytes object's buffer.
+    pub fn greenSendResponse(
+        self: *Hub,
+        fd: posix.fd_t,
+        status: http_response.StatusCode,
+        zig_headers: []const http_response.Header,
+        body_obj: *PyObject,
+        body_slice: []const u8,
+    ) ?*PyObject {
+        const conn = self.getConn(fd) orelse {
+            py.py_helper_err_set_string(
+                py.py_helper_exc_oserror(),
+                "http_send_response: no connection for fd",
+            );
+            return null;
+        };
+
+        // Estimate headers, allocate from arena, format
+        const est = estimateHeaderSize(status, zig_headers, body_slice.len);
+        const hdr_buf = conn.arena.alloc(est) orelse {
+            _ = py.py_helper_err_no_memory();
+            return null;
+        };
+
+        const hdr_len = http_response.writeResponseHead(
+            hdr_buf,
+            status,
+            zig_headers,
+            body_slice.len,
+        ) catch {
+            py.py_helper_err_set_string(
+                py.py_helper_exc_runtime_error(),
+                "http_send_response: header format overflow (bug in estimateHeaderSize)",
+            );
+            return null;
+        };
+
+        // Build iovec array: [headers] or [headers, body]
+        // Skip body iovec if empty (e.g. 204 No Content)
+        var iovecs: [2]posix.iovec_const = undefined;
+        iovecs[0] = .{ .base = hdr_buf.ptr, .len = hdr_len };
+        var iov_count: usize = 1;
+        if (body_slice.len > 0) {
+            iovecs[1] = .{ .base = body_slice.ptr, .len = body_slice.len };
+            iov_count = 2;
+        }
+
+        // Incref body_obj to keep it alive during async send
+        py.py_helper_incref(body_obj);
+
+        const current = py.py_helper_greenlet_getcurrent() orelse {
+            py.py_helper_decref(body_obj);
+            return null;
+        };
+
+        // Partial writev loop (same pattern as greenSend)
+        var iov_offset: usize = 0;
+        var first_switch_done = false;
+        while (iov_offset < iov_count) {
+            // Skip fully-sent iovecs
+            while (iov_offset < iov_count and iovecs[iov_offset].len == 0) {
+                iov_offset += 1;
+            }
+            if (iov_offset >= iov_count) break;
+
+            const remaining_iovecs = iovecs[iov_offset..iov_count];
+            const user_data = conn_mod.encodeUserData(conn.pool_index, conn.generation);
+            _ = self.ring.prepWritev(fd, remaining_iovecs, user_data) catch {
+                py.py_helper_decref(body_obj);
+                if (!first_switch_done) py.py_helper_decref(current);
+                py.py_helper_err_set_string(
+                    py.py_helper_exc_oserror(),
+                    "http_send_response: failed to submit writev SQE",
+                );
+                return null;
+            };
+
+            conn.greenlet = current;
+            conn.state = .writing;
+            conn.pending_ops += 1;
+            self.active_waits += 1;
+
+            const hub_g = self.hub_greenlet orelse {
+                py.py_helper_err_set_string(
+                    py.py_helper_exc_runtime_error(),
+                    "http_send_response: hub greenlet not set",
+                );
+                conn.greenlet = null;
+                conn.state = .idle;
+                conn.pending_ops -= 1;
+                self.active_waits -= 1;
+                py.py_helper_decref(current);
+                py.py_helper_decref(body_obj);
+                return null;
+            };
+            const switch_result = py.py_helper_greenlet_switch(hub_g, null, null);
+            first_switch_done = true;
+            if (switch_result == null) {
+                py.py_helper_decref(body_obj);
+                return null;
+            }
+            py.py_helper_decref(switch_result);
+
+            const res = conn.result;
+            if (res < 0) {
+                py.py_helper_decref(body_obj);
+                py.py_helper_err_set_from_errno(-res);
+                return null;
+            }
+
+            // Advance iovecs past the bytes written
+            var written: usize = @intCast(res);
+            while (written > 0 and iov_offset < iov_count) {
+                if (written >= iovecs[iov_offset].len) {
+                    written -= iovecs[iov_offset].len;
+                    iovecs[iov_offset].len = 0;
+                    iov_offset += 1;
+                } else {
+                    iovecs[iov_offset].base += written;
+                    iovecs[iov_offset].len -= written;
+                    written = 0;
+                }
+            }
+        }
+
+        py.py_helper_decref(body_obj);
+        const total: usize = hdr_len + body_slice.len;
+        return py.PyLong_FromLong(@as(c_long, @intCast(total)));
+    }
+
+    // -----------------------------------------------------------------------
     // green_close: cancel pending ops, close fd, release connection
     // -----------------------------------------------------------------------
 
@@ -1902,6 +2038,33 @@ fn methodToStr(method: http.Method) []const u8 {
     };
 }
 
+/// Compute an upper bound on the formatted HTTP/1.1 response header size.
+/// Mirrors h2o's flatten_headers_estimate_size(): headers only, not body.
+/// Typical result is ~200-500 bytes -- always bump-allocated in the arena.
+fn estimateHeaderSize(
+    status: http_response.StatusCode,
+    headers: []const http_response.Header,
+    body_len: usize,
+) usize {
+    _ = body_len;
+    // Status line: "HTTP/1.1 XXX {phrase}\r\n"
+    var len: usize = "HTTP/1.1  \r\n".len + 3 + status.phrase().len;
+
+    // Content-Length header: "Content-Length: {digits}\r\n"
+    // 20 digits = worst-case for u64 (h2o uses sizeof(H2O_UINT64_LONGEST_STR))
+    len += "Content-Length: \r\n".len + 20;
+
+    // Final CRLF separating headers from body
+    len += "\r\n".len;
+
+    // User headers: sum actual name + value lengths + 4 bytes per header for ": \r\n"
+    for (headers) |hdr| {
+        len += hdr.name.len + hdr.value.len + 4;
+    }
+
+    return len;
+}
+
 fn statusFromInt(code: u16) ?http_response.StatusCode {
     return switch (code) {
         200 => .ok,
@@ -2058,48 +2221,32 @@ fn extractBytesSlice(obj: *PyObject) ?[]const u8 {
     return ptr[0..len];
 }
 
-/// Heap-allocated fallback for responses that exceed the 64 KB stack buffer.
-fn formatLargeResponse(
-    status: http_response.StatusCode,
-    headers: []const http_response.Header,
-    body: []const u8,
-) ?*PyObject {
-    // Estimate size: status line (~30) + headers (~100 each) + body
-    const est = 256 + headers.len * 128 + body.len;
-    const buf = std.heap.c_allocator.alloc(u8, est) catch {
-        _ = py.py_helper_err_no_memory();
+/// http_send_response(fd, status, headers, body) -> int
+///
+/// Formats response headers into the per-connection arena, then sends
+/// headers + body via writev. Zero-copy for the body.
+pub fn pyHttpSendResponse(
+    _: ?*PyObject,
+    args: ?*PyObject,
+) callconv(.c) ?*PyObject {
+    var fd_long: c_long = 0;
+    var status_long: c_long = 0;
+    var headers_list: ?*PyObject = null;
+    var body_obj: ?*PyObject = null;
+    if (py.PyArg_ParseTuple(args, "llOS", &fd_long, &status_long, &headers_list, &body_obj) == 0)
         return null;
-    };
-    defer std.heap.c_allocator.free(buf);
 
-    const n = http_response.writeResponse(buf, status, headers, body) catch {
+    const hub_ptr = getHub() orelse {
         py.py_helper_err_set_string(
             py.py_helper_exc_runtime_error(),
-            "Response too large",
+            "http_send_response: hub not running",
         );
         return null;
     };
 
-    return py.py_helper_bytes_from_string_and_size(@ptrCast(buf.ptr), @intCast(n));
-}
+    const fd: posix.fd_t = @intCast(fd_long);
 
-/// http_format_response_full(status, headers, body) -> bytes
-///
-/// Formats a complete HTTP/1.1 response from status code, a list of
-/// (name, value) header tuples, and a body bytes object.
-/// Uses a 64 KB stack buffer for typical responses; falls back to heap
-/// allocation for larger ones.
-pub fn pyHttpFormatResponseFull(
-    _: ?*PyObject,
-    args: ?*PyObject,
-) callconv(.c) ?*PyObject {
-    var status_long: c_long = 0;
-    var headers_list: ?*PyObject = null;
-    var body_obj: ?*PyObject = null;
-    if (py.PyArg_ParseTuple(args, "lOS", &status_long, &headers_list, &body_obj) == 0)
-        return null;
-
-    // Convert status code integer to StatusCode enum
+    // Convert status code
     const status_code: u16 = @intCast(status_long);
     const status = statusFromInt(status_code) orelse {
         py.py_helper_err_set_string(
@@ -2109,11 +2256,11 @@ pub fn pyHttpFormatResponseFull(
         return null;
     };
 
-    // Extract body pointer and length
+    // Extract body
     const body_ptr: [*]const u8 = @ptrCast(py.py_helper_bytes_as_string(body_obj.?) orelse {
         py.py_helper_err_set_string(
             py.py_helper_exc_runtime_error(),
-            "http_format_response_full: invalid body bytes",
+            "http_send_response: invalid body bytes",
         );
         return null;
     });
@@ -2125,7 +2272,6 @@ pub fn pyHttpFormatResponseFull(
     if (n_headers_raw < 0) return null;
     const n_headers: usize = @intCast(n_headers_raw);
 
-    // Use stack array for up to 64 headers; heap-allocate for more
     var stack_headers: [64]http_response.Header = undefined;
     var heap_headers: ?[]http_response.Header = null;
     defer if (heap_headers) |h| std.heap.c_allocator.free(h);
@@ -2148,14 +2294,14 @@ pub fn pyHttpFormatResponseFull(
         const name_slice = extractBytesSlice(name_obj) orelse {
             py.py_helper_err_set_string(
                 py.py_helper_exc_runtime_error(),
-                "http_format_response_full: invalid header name bytes",
+                "http_send_response: invalid header name bytes",
             );
             return null;
         };
         const val_slice = extractBytesSlice(val_obj) orelse {
             py.py_helper_err_set_string(
                 py.py_helper_exc_runtime_error(),
-                "http_format_response_full: invalid header value bytes",
+                "http_send_response: invalid header value bytes",
             );
             return null;
         };
@@ -2166,14 +2312,7 @@ pub fn pyHttpFormatResponseFull(
         };
     }
 
-    // Format into 64 KB stack buffer
-    var buf: [65536]u8 = undefined;
-    const n = http_response.writeResponse(&buf, status, zig_headers, body_slice) catch {
-        // Response too large for stack buffer — fall back to heap
-        return formatLargeResponse(status, zig_headers, body_slice);
-    };
-
-    return py.py_helper_bytes_from_string_and_size(@ptrCast(&buf), @intCast(n));
+    return hub_ptr.greenSendResponse(fd, status, zig_headers, body_obj.?, body_slice);
 }
 
 // ---------------------------------------------------------------------------
@@ -2876,4 +3015,47 @@ test "allocSlice: basic typed allocation" {
     headers[31] = .{ .key = "X-Last", .value = "yes" };
     try std.testing.expectEqualStrings("Host", headers[0].key);
     try std.testing.expectEqualStrings("X-Last", headers[31].key);
+}
+
+// ---------------------------------------------------------------------------
+// estimateHeaderSize tests
+// ---------------------------------------------------------------------------
+
+test "header estimate covers small response" {
+    const headers = [_]http_response.Header{
+        .{ .name = "Content-Type", .value = "text/plain" },
+    };
+    const est = estimateHeaderSize(.ok, &headers, 5);
+    var buf: [4096]u8 = undefined;
+    const actual = try http_response.writeResponseHead(&buf, .ok, &headers, 5);
+    try std.testing.expect(est >= actual);
+}
+
+test "header estimate covers large JWT header" {
+    const jwt = "eyJ" ++ "x" ** 500 ++ "abc";
+    const headers = [_]http_response.Header{
+        .{ .name = "Authorization", .value = jwt },
+    };
+    const est = estimateHeaderSize(.ok, &headers, 2);
+    var buf: [4096]u8 = undefined;
+    const actual = try http_response.writeResponseHead(&buf, .ok, &headers, 2);
+    try std.testing.expect(est >= actual);
+}
+
+test "header estimate covers empty response" {
+    const est = estimateHeaderSize(.no_content, &.{}, 0);
+    var buf: [4096]u8 = undefined;
+    const actual = try http_response.writeResponseHead(&buf, .no_content, &.{}, 0);
+    try std.testing.expect(est >= actual);
+}
+
+test "header estimate covers many headers" {
+    var headers: [32]http_response.Header = undefined;
+    for (&headers) |*h| {
+        h.* = .{ .name = "X-Custom-Header", .value = "some-value" };
+    }
+    const est = estimateHeaderSize(.ok, &headers, 4);
+    var buf: [4096]u8 = undefined;
+    const actual = try http_response.writeResponseHead(&buf, .ok, &headers, 4);
+    try std.testing.expect(est >= actual);
 }

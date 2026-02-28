@@ -121,6 +121,38 @@ pub fn writeResponse(buf: []u8, status: StatusCode, headers: []const Header, bod
     return pos;
 }
 
+/// Writes the status line, user headers, auto-generated Content-Length,
+/// and the terminating blank line. No body.
+///
+/// Returns the total number of bytes written.
+pub fn writeResponseHead(
+    buf: []u8,
+    status: StatusCode,
+    headers: []const Header,
+    body_len: usize,
+) WriteError!usize {
+    var pos: usize = 0;
+
+    try writeStatusLine(buf, &pos, status);
+
+    for (headers) |hdr| {
+        try writeHeaderLine(buf, &pos, hdr);
+    }
+
+    // Auto-generate Content-Length header.
+    var cl_buf: [32]u8 = undefined;
+    const cl_str = std.fmt.bufPrint(&cl_buf, "{d}", .{body_len}) catch
+        return error.BufferTooSmall;
+    try append(buf, &pos, "Content-Length: ");
+    try append(buf, &pos, cl_str);
+    try append(buf, &pos, "\r\n");
+
+    // Blank line separating headers from body.
+    try append(buf, &pos, "\r\n");
+
+    return pos;
+}
+
 /// Writes the status line and headers (with terminating blank line) but no body.
 ///
 /// Does NOT add a Content-Length header automatically. This is intended for
@@ -277,4 +309,27 @@ test "writeResponse 204 No Content" {
     const n = try writeResponse(&buf, .no_content, &.{}, "");
     const expected = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n";
     try std.testing.expectEqualStrings(expected, buf[0..n]);
+}
+
+test "writeResponseHead produces correct output" {
+    var buf: [4096]u8 = undefined;
+    const headers = [_]Header{
+        .{ .name = "Content-Type", .value = "text/plain" },
+    };
+    const n = try writeResponseHead(&buf, .ok, &headers, 11);
+    const expected = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 11\r\n\r\n";
+    try std.testing.expectEqualStrings(expected, buf[0..n]);
+}
+
+test "writeResponseHead no headers" {
+    var buf: [4096]u8 = undefined;
+    const n = try writeResponseHead(&buf, .not_found, &.{}, 0);
+    const expected = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+    try std.testing.expectEqualStrings(expected, buf[0..n]);
+}
+
+test "writeResponseHead buffer too small" {
+    var buf: [10]u8 = undefined;
+    const result = writeResponseHead(&buf, .ok, &.{}, 0);
+    try std.testing.expectError(error.BufferTooSmall, result);
 }
