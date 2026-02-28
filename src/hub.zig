@@ -38,7 +38,7 @@ const CQE_BATCH_SIZE: usize = 256;
 const MAX_POLL_FDS: usize = 64;
 const IOSQE_IO_LINK: u8 = 1 << 2;
 const RECV_SIZE: usize = 8192;
-const INITIAL_HEADER_CAPACITY: usize = 32;
+const MAX_HEADERS: usize = 100;
 
 // ---------------------------------------------------------------------------
 // Hub struct
@@ -2340,81 +2340,68 @@ const ParseResult = union(enum) {
     arena_oom,
 };
 
-/// Parse with arena-allocated headers. No fixed limit on header count.
+/// Parse with arena-allocated headers. Fixed limit of MAX_HEADERS.
 ///
 /// Like h2o: header structs live in the per-request arena (bump-allocated),
 /// header name/value slices are zero-copy pointers into buf (the InputBuffer).
-/// If 32 headers aren't enough, we double and re-parse from the arena.
+/// If more than MAX_HEADERS are present, the request is rejected.
 fn tryParse(
     buf: []const u8,
     max_header_size: usize,
     max_body_size: usize,
     arena: *RequestArena,
 ) ParseResult {
-    var capacity: usize = INITIAL_HEADER_CAPACITY;
+    // Allocate header array from the arena (bump allocation, O(1))
+    var headers = arena.allocSlice(http.Header, MAX_HEADERS) orelse return .arena_oom;
 
-    // Allocate initial header array from the arena (bump allocation, O(1))
-    var headers = arena.allocSlice(http.Header, capacity) orelse return .arena_oom;
+    var method: http.Method = .unknown;
+    var path: ?[]const u8 = null;
+    var version: http.Version = .@"1.0";
+    var header_count: usize = 0;
 
-    while (true) {
-        var method: http.Method = .unknown;
-        var path: ?[]const u8 = null;
-        var version: http.Version = .@"1.0";
-        var header_count: usize = 0;
+    const header_bytes = hparse.parseRequest(
+        buf,
+        &method,
+        &path,
+        &version,
+        headers,
+        &header_count,
+    ) catch |err| switch (err) {
+        error.Incomplete => return .incomplete,
+        error.Invalid => return .invalid,
+    };
 
-        const header_bytes = hparse.parseRequest(
-            buf,
-            &method,
-            &path,
-            &version,
-            headers,
-            &header_count,
-        ) catch |err| switch (err) {
-            error.Incomplete => return .incomplete,
-            error.Invalid => return .invalid,
-        };
+    // Validate limits.
+    if (header_bytes > max_header_size) return .header_too_large;
 
-        // If hparse filled the entire slice, there may be more headers.
-        // Grow and re-parse (like h2o's pool — just bump-allocate more).
-        // The old allocation is abandoned in the arena (freed at request end).
-        if (header_count == capacity) {
-            capacity *= 2;
-            headers = arena.allocSlice(http.Header, capacity) orelse return .arena_oom;
-            continue; // re-parse with larger slice
+    // Determine body length
+    const content_length: usize = blk: {
+        const cl = http.findHeader(headers[0..header_count], "content-length") orelse break :blk 0;
+        const trimmed = std.mem.trim(u8, cl, &std.ascii.whitespace);
+        break :blk std.fmt.parseInt(usize, trimmed, 10) catch return .invalid;
+    };
+
+    if (content_length > max_body_size) return .body_too_large;
+    if (buf.len < header_bytes + content_length) return .incomplete;
+
+    // Resolve keep-alive
+    const ka = blk: {
+        if (http.findHeader(headers[0..header_count], "connection")) |conn_hdr| {
+            if (std.ascii.eqlIgnoreCase(conn_hdr, "close")) break :blk false;
+            if (std.ascii.eqlIgnoreCase(conn_hdr, "keep-alive")) break :blk true;
         }
+        break :blk version == .@"1.1";
+    };
 
-        // Headers fit. Now validate limits.
-        if (header_bytes > max_header_size) return .header_too_large;
-
-        // Determine body length
-        const content_length: usize = blk: {
-            const cl = http.findHeader(headers[0..header_count], "content-length") orelse break :blk 0;
-            const trimmed = std.mem.trim(u8, cl, &std.ascii.whitespace);
-            break :blk std.fmt.parseInt(usize, trimmed, 10) catch return .invalid;
-        };
-
-        if (content_length > max_body_size) return .body_too_large;
-        if (buf.len < header_bytes + content_length) return .incomplete;
-
-        // Resolve keep-alive
-        const ka = blk: {
-            if (http.findHeader(headers[0..header_count], "connection")) |conn_hdr| {
-                if (std.ascii.eqlIgnoreCase(conn_hdr, "close")) break :blk false;
-                if (std.ascii.eqlIgnoreCase(conn_hdr, "keep-alive")) break :blk true;
-            }
-            break :blk version == .@"1.1";
-        };
-
-        return .{ .complete = .{
-            .method = method,
-            .path = path orelse return .invalid,
-            .version = version,
-            .headers = headers[0..header_count], // arena-owned slice
-            .body = buf[header_bytes .. header_bytes + content_length],
-            .raw_bytes_consumed = header_bytes + content_length,
-            .keep_alive = ka,
-        } };
-    }
+    return .{ .complete = .{
+        .method = method,
+        .path = path orelse return .invalid,
+        .version = version,
+        .headers = headers[0..header_count], // arena-owned slice
+        .body = buf[header_bytes .. header_bytes + content_length],
+        .raw_bytes_consumed = header_bytes + content_length,
+        .keep_alive = ka,
+    } };
 }
 
 /// Convert a parsed request to a Python 5-tuple.
