@@ -11,7 +11,6 @@ pub const ArenaConfig = extern struct {
     chunk_size: u32, // default 4096
     max_header_size: u32, // default 32768 (32 KB)
     max_body_size: u32, // default 1048576 (1 MB)
-    max_request_size: u32, // default 1114112 (1 MB + 64 KB)
     max_connections: u16, // default 4096
     read_timeout_ms: u32, // default 30000 (future use)
     keepalive_timeout_ms: u32, // default 5000 (future use)
@@ -23,7 +22,6 @@ pub const ArenaConfig = extern struct {
             .chunk_size = 4096,
             .max_header_size = 32768,
             .max_body_size = 1_048_576,
-            .max_request_size = 1_114_112,
             .max_connections = 4096,
             .read_timeout_ms = 30_000,
             .keepalive_timeout_ms = 5_000,
@@ -48,7 +46,6 @@ test "defaults returns expected values" {
     try std.testing.expectEqual(@as(u32, 4096), config.chunk_size);
     try std.testing.expectEqual(@as(u32, 32768), config.max_header_size);
     try std.testing.expectEqual(@as(u32, 1_048_576), config.max_body_size);
-    try std.testing.expectEqual(@as(u32, 1_114_112), config.max_request_size);
     try std.testing.expectEqual(@as(u16, 4096), config.max_connections);
     try std.testing.expectEqual(@as(u32, 30_000), config.read_timeout_ms);
     try std.testing.expectEqual(@as(u32, 5_000), config.keepalive_timeout_ms);

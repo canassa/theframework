@@ -19,6 +19,7 @@ const DirectAlloc = struct {
 /// The first_chunk is embedded in the Connection struct (always available,
 /// zero allocation). Additional chunks come from the hub-local ChunkRecycler.
 /// Large single allocations go through direct malloc.
+/// The arena grows without bound until malloc fails.
 ///
 /// All memory is reclaimed in one call to reset().
 pub const RequestArena = struct {
@@ -39,18 +40,13 @@ pub const RequestArena = struct {
     /// Hub-local chunk recycler.
     recycler: *ChunkRecycler,
 
-    /// Config snapshot.
-    config: ArenaConfig,
-
-    /// Total bytes allocated this request (for hard limit checking).
-    total_allocated: usize,
-
-    /// Cached direct-alloc threshold.
+    /// Direct-alloc threshold: allocations >= this size bypass bump allocation
+    /// and go to direct malloc.
     direct_threshold: usize,
 
-    /// Initialize arena with a given first chunk, recycler, and config.
+    /// Initialize arena with a given first chunk, recycler, and direct threshold.
     /// The first_chunk is typically embedded inline in the Connection struct.
-    pub fn init(first_chunk: *Chunk, recycler: *ChunkRecycler, config: ArenaConfig) RequestArena {
+    pub fn init(first_chunk: *Chunk, recycler: *ChunkRecycler, direct_threshold: usize) RequestArena {
         first_chunk.next = null;
         return .{
             .chunks = first_chunk,
@@ -58,18 +54,14 @@ pub const RequestArena = struct {
             .directs = null,
             .first_chunk = first_chunk,
             .recycler = recycler,
-            .config = config,
-            .total_allocated = 0,
-            .direct_threshold = config.directThreshold(),
+            .direct_threshold = direct_threshold,
         };
     }
 
-    /// Allocate `sz` bytes. Returns null if hard limit exceeded or OOM.
+    /// Allocate `sz` bytes. Returns null on OOM.
     /// The arena does NOT free individual allocations -- only reset() reclaims.
     /// All returned slices remain valid until reset().
     pub fn alloc(self: *RequestArena, sz: usize) ?[]u8 {
-        if (self.total_allocated + sz > self.config.max_request_size) return null;
-
         const size = if (sz == 0) 1 else sz;
 
         // Large allocation: direct malloc
@@ -79,7 +71,6 @@ pub const RequestArena = struct {
         if (Chunk.CHUNK_SIZE - self.chunk_offset >= size) {
             const start = self.chunk_offset;
             self.chunk_offset += size;
-            self.total_allocated += size;
             return self.chunks.?.bytes[start..][0..size];
         }
 
@@ -93,7 +84,6 @@ pub const RequestArena = struct {
         new_chunk.next = self.chunks;
         self.chunks = new_chunk;
         self.chunk_offset = Chunk.DATA_START + size;
-        self.total_allocated += size;
         return new_chunk.bytes[Chunk.DATA_START..][0..size];
     }
 
@@ -107,17 +97,13 @@ pub const RequestArena = struct {
         header.next = self.directs;
         header.size = size;
         self.directs = header;
-        self.total_allocated += size;
         return raw[header_size..][0..size];
     }
 
     /// Get writable space in the current chunk for recv.
     /// If the current chunk is full, grabs a new one from the recycler.
-    /// Returns null if the hard limit is exceeded or OOM.
+    /// Returns null on OOM.
     pub fn currentFreeSlice(self: *RequestArena, max_len: usize) ?[]u8 {
-        // Hard limit check
-        if (self.total_allocated >= self.config.max_request_size) return null;
-
         const remaining = Chunk.CHUNK_SIZE - self.chunk_offset;
         if (remaining == 0) {
             const new_chunk = self.recycler.acquire() catch return null;
@@ -135,7 +121,6 @@ pub const RequestArena = struct {
     pub fn commitBytes(self: *RequestArena, nbytes: usize) void {
         std.debug.assert(self.chunk_offset + nbytes <= Chunk.CHUNK_SIZE);
         self.chunk_offset += nbytes;
-        self.total_allocated += nbytes;
     }
 
     /// Reset for the next request. Return linked chunks to recycler,
@@ -168,12 +153,6 @@ pub const RequestArena = struct {
         self.chunks = self.first_chunk;
         self.chunk_offset = Chunk.DATA_START;
         self.directs = null;
-        self.total_allocated = 0;
-    }
-
-    /// Return total bytes allocated this request.
-    pub fn totalUsed(self: *const RequestArena) usize {
-        return self.total_allocated;
     }
 
     /// Return bytes remaining in the current chunk.
@@ -182,7 +161,7 @@ pub const RequestArena = struct {
     }
 
     /// Allocate a typed slice of `n` elements from the arena with proper alignment.
-    /// Returns null if the hard limit is exceeded or OOM.
+    /// Returns null on OOM.
     /// The returned slice remains valid until reset().
     pub fn allocSlice(self: *RequestArena, comptime T: type, n: usize) ?[]T {
         const byte_count = @sizeOf(T) * n;
@@ -205,7 +184,7 @@ test "small alloc fits in first chunk (no recycler interaction)" {
     defer allocator.destroy(first_chunk);
 
     const config = ArenaConfig.defaults();
-    var arena = RequestArena.init(first_chunk, &recycler, config);
+    var arena = RequestArena.init(first_chunk, &recycler, config.directThreshold());
     defer arena.reset();
 
     // Small alloc should fit in first chunk
@@ -221,7 +200,6 @@ test "small alloc fits in first chunk (no recycler interaction)" {
 
     // No chunks should have been acquired from recycler
     try std.testing.expectEqual(@as(usize, 0), recycler.total_allocated);
-    try std.testing.expectEqual(@as(usize, 64), arena.totalUsed());
 }
 
 test "fill first chunk, next alloc grabs from recycler" {
@@ -233,7 +211,7 @@ test "fill first chunk, next alloc grabs from recycler" {
     defer allocator.destroy(first_chunk);
 
     const config = ArenaConfig.defaults();
-    var arena = RequestArena.init(first_chunk, &recycler, config);
+    var arena = RequestArena.init(first_chunk, &recycler, config.directThreshold());
     defer arena.reset();
 
     // Fill up the first chunk. Usable = 4088 bytes. Use small allocs below threshold.
@@ -266,7 +244,7 @@ test "large alloc (>= direct_threshold) goes to direct malloc" {
     defer allocator.destroy(first_chunk);
 
     const config = ArenaConfig.defaults();
-    var arena = RequestArena.init(first_chunk, &recycler, config);
+    var arena = RequestArena.init(first_chunk, &recycler, config.directThreshold());
     defer arena.reset();
 
     // direct_threshold = 1022
@@ -287,8 +265,6 @@ test "large alloc (>= direct_threshold) goes to direct malloc" {
     @memset(buf, 0xAB);
     try std.testing.expectEqual(@as(u8, 0xAB), buf[0]);
     try std.testing.expectEqual(@as(u8, 0xAB), buf[1021]);
-
-    try std.testing.expectEqual(@as(usize, 1022), arena.totalUsed());
 }
 
 test "reset returns chunks to recycler (verify cachedCount)" {
@@ -300,7 +276,7 @@ test "reset returns chunks to recycler (verify cachedCount)" {
     defer allocator.destroy(first_chunk);
 
     const config = ArenaConfig.defaults();
-    var arena = RequestArena.init(first_chunk, &recycler, config);
+    var arena = RequestArena.init(first_chunk, &recycler, config.directThreshold());
 
     // Force overflow to grab 2 additional chunks from recycler
     // Each chunk has USABLE=4088 bytes. Fill first, then 2 more.
@@ -325,7 +301,6 @@ test "reset returns chunks to recycler (verify cachedCount)" {
     arena.reset();
 
     try std.testing.expectEqual(@as(usize, 2), recycler.cachedCount());
-    try std.testing.expectEqual(@as(usize, 0), arena.totalUsed());
 }
 
 test "reset frees directs" {
@@ -337,7 +312,7 @@ test "reset frees directs" {
     defer allocator.destroy(first_chunk);
 
     const config = ArenaConfig.defaults();
-    var arena = RequestArena.init(first_chunk, &recycler, config);
+    var arena = RequestArena.init(first_chunk, &recycler, config.directThreshold());
 
     // Allocate several direct (large) allocations
     const buf1 = arena.alloc(2000) orelse return error.TestUnexpectedResult;
@@ -348,13 +323,11 @@ test "reset frees directs" {
     @memset(buf2, 0x22);
 
     try std.testing.expect(arena.directs != null);
-    try std.testing.expectEqual(@as(usize, 7000), arena.totalUsed());
 
     // Reset should free all directs
     arena.reset();
 
     try std.testing.expect(arena.directs == null);
-    try std.testing.expectEqual(@as(usize, 0), arena.totalUsed());
 }
 
 test "reset + re-alloc reuses first chunk (chunk_offset back to DATA_START)" {
@@ -366,7 +339,7 @@ test "reset + re-alloc reuses first chunk (chunk_offset back to DATA_START)" {
     defer allocator.destroy(first_chunk);
 
     const config = ArenaConfig.defaults();
-    var arena = RequestArena.init(first_chunk, &recycler, config);
+    var arena = RequestArena.init(first_chunk, &recycler, config.directThreshold());
 
     // Alloc some data
     const buf1 = arena.alloc(100) orelse return error.TestUnexpectedResult;
@@ -379,7 +352,6 @@ test "reset + re-alloc reuses first chunk (chunk_offset back to DATA_START)" {
 
     // chunk_offset should be back to DATA_START
     try std.testing.expectEqual(Chunk.DATA_START, arena.chunk_offset);
-    try std.testing.expectEqual(@as(usize, 0), arena.totalUsed());
 
     // Alloc again -- should reuse the same first chunk
     const buf2 = arena.alloc(100) orelse return error.TestUnexpectedResult;
@@ -395,44 +367,6 @@ test "reset + re-alloc reuses first chunk (chunk_offset back to DATA_START)" {
     arena.reset();
 }
 
-test "hard limit: alloc beyond max_request_size returns null" {
-    const allocator = std.testing.allocator;
-    var recycler = ChunkRecycler.init(allocator);
-    defer recycler.deinit();
-
-    const first_chunk = try allocator.create(Chunk);
-    defer allocator.destroy(first_chunk);
-
-    // Use a small max_request_size for testing
-    var config = ArenaConfig.defaults();
-    config.max_request_size = 200;
-
-    var arena = RequestArena.init(first_chunk, &recycler, config);
-    defer arena.reset();
-
-    // Alloc 150 bytes -- should succeed
-    const buf1 = arena.alloc(150);
-    try std.testing.expect(buf1 != null);
-    try std.testing.expectEqual(@as(usize, 150), arena.totalUsed());
-
-    // Alloc 60 bytes -- would push total to 210 > 200, should return null
-    const buf2 = arena.alloc(60);
-    try std.testing.expect(buf2 == null);
-
-    // Total should not have changed
-    try std.testing.expectEqual(@as(usize, 150), arena.totalUsed());
-
-    // Alloc 50 bytes -- would push total to 200 = max_request_size, should return null
-    // (check is > not >=, so 200 > 200 is false, 200 should succeed)
-    const buf3 = arena.alloc(50);
-    try std.testing.expect(buf3 != null);
-    try std.testing.expectEqual(@as(usize, 200), arena.totalUsed());
-
-    // Alloc 1 more byte -- 201 > 200, should fail
-    const buf4 = arena.alloc(1);
-    try std.testing.expect(buf4 == null);
-}
-
 test "currentFreeSlice + commitBytes round-trip" {
     const allocator = std.testing.allocator;
     var recycler = ChunkRecycler.init(allocator);
@@ -442,7 +376,7 @@ test "currentFreeSlice + commitBytes round-trip" {
     defer allocator.destroy(first_chunk);
 
     const config = ArenaConfig.defaults();
-    var arena = RequestArena.init(first_chunk, &recycler, config);
+    var arena = RequestArena.init(first_chunk, &recycler, config.directThreshold());
     defer arena.reset();
 
     // Get a free slice
@@ -455,9 +389,6 @@ test "currentFreeSlice + commitBytes round-trip" {
 
     // Commit the bytes we wrote
     arena.commitBytes(message.len);
-
-    // Verify total_allocated advanced
-    try std.testing.expectEqual(@as(usize, message.len), arena.totalUsed());
 
     // chunk_offset should have advanced by message.len
     try std.testing.expectEqual(Chunk.DATA_START + message.len, arena.chunk_offset);
@@ -478,7 +409,7 @@ test "multiple allocs across multiple chunks, verify all slices valid" {
     defer allocator.destroy(first_chunk);
 
     const config = ArenaConfig.defaults();
-    var arena = RequestArena.init(first_chunk, &recycler, config);
+    var arena = RequestArena.init(first_chunk, &recycler, config.directThreshold());
     defer arena.reset();
 
     // Allocate many slices across multiple chunks
@@ -505,7 +436,6 @@ test "multiple allocs across multiple chunks, verify all slices valid" {
     // Should have allocated from recycler (20 * 800 = 16000, first chunk holds 5,
     // so we need 3 more chunks)
     try std.testing.expect(recycler.total_allocated >= 3);
-    try std.testing.expectEqual(@as(usize, 20 * 800), arena.totalUsed());
 }
 
 test "zero-size alloc returns valid 1-byte slice" {
@@ -517,7 +447,7 @@ test "zero-size alloc returns valid 1-byte slice" {
     defer allocator.destroy(first_chunk);
 
     const config = ArenaConfig.defaults();
-    var arena = RequestArena.init(first_chunk, &recycler, config);
+    var arena = RequestArena.init(first_chunk, &recycler, config.directThreshold());
     defer arena.reset();
 
     // Zero-size alloc should return a valid 1-byte slice
@@ -527,32 +457,6 @@ test "zero-size alloc returns valid 1-byte slice" {
     // Should be writable
     buf[0] = 0xFF;
     try std.testing.expectEqual(@as(u8, 0xFF), buf[0]);
-
-    // total_allocated should reflect the actual 1 byte used
-    try std.testing.expectEqual(@as(usize, 1), arena.totalUsed());
-}
-
-test "currentFreeSlice returns null when hard limit exceeded" {
-    const allocator = std.testing.allocator;
-    var recycler = ChunkRecycler.init(allocator);
-    defer recycler.deinit();
-
-    const first_chunk = try allocator.create(Chunk);
-    defer allocator.destroy(first_chunk);
-
-    var config = ArenaConfig.defaults();
-    config.max_request_size = 100;
-
-    var arena = RequestArena.init(first_chunk, &recycler, config);
-    defer arena.reset();
-
-    // Use alloc to get close to the limit
-    _ = arena.alloc(100) orelse return error.TestUnexpectedResult;
-
-    // total_allocated is now 100, which equals max_request_size
-    // currentFreeSlice checks total_allocated >= max_request_size
-    const slice = arena.currentFreeSlice(64);
-    try std.testing.expect(slice == null);
 }
 
 test "currentFreeSlice grabs new chunk when current is full" {
@@ -564,7 +468,7 @@ test "currentFreeSlice grabs new chunk when current is full" {
     defer allocator.destroy(first_chunk);
 
     const config = ArenaConfig.defaults();
-    var arena = RequestArena.init(first_chunk, &recycler, config);
+    var arena = RequestArena.init(first_chunk, &recycler, config.directThreshold());
     defer arena.reset();
 
     // Fill the first chunk completely using alloc
@@ -598,7 +502,7 @@ test "mixed alloc and direct alloc, then reset cleans everything" {
     defer allocator.destroy(first_chunk);
 
     const config = ArenaConfig.defaults();
-    var arena = RequestArena.init(first_chunk, &recycler, config);
+    var arena = RequestArena.init(first_chunk, &recycler, config.directThreshold());
 
     // Small alloc in first chunk
     const small = arena.alloc(100) orelse return error.TestUnexpectedResult;
@@ -616,23 +520,17 @@ test "mixed alloc and direct alloc, then reset cleans everything" {
     // First chunk has 4088 usable, already used 300 (100 + 200), remaining = 3788.
     // Fill remaining with 512-byte allocs: 3788 / 512 = 7 fit (3584), leaving 204.
     // Then one more 512 alloc overflows to a new chunk.
-    var overflow_total: usize = 0;
     for (0..8) |_| {
         _ = arena.alloc(512) orelse return error.TestUnexpectedResult;
-        overflow_total += 512;
     }
 
     try std.testing.expect(arena.directs != null);
     try std.testing.expect(recycler.total_allocated >= 1);
 
-    const total_before = arena.totalUsed();
-    try std.testing.expectEqual(@as(usize, 100 + 2000 + 200 + overflow_total), total_before);
-
     // Reset should clean everything
     arena.reset();
 
     try std.testing.expect(arena.directs == null);
-    try std.testing.expectEqual(@as(usize, 0), arena.totalUsed());
     try std.testing.expectEqual(Chunk.DATA_START, arena.chunk_offset);
     try std.testing.expectEqual(arena.chunks, @as(?*Chunk, arena.first_chunk));
 }

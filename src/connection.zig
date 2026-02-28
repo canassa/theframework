@@ -106,7 +106,7 @@ pub const ConnectionPool = struct {
             connections[i].arena = RequestArena.init(
                 &connections[i].inline_chunk,
                 recycler,
-                config,
+                config.directThreshold(),
             );
             connections[i].input = InputBuffer.init(
                 &connections[i].inline_buf,
@@ -391,14 +391,12 @@ test "Connection arena integration: alloc, reset, reuse" {
     try std.testing.expectEqual(@as(usize, 256), slice.len);
     @memset(slice[0..13], 'H');
     conn.arena.commitBytes(13);
-    try std.testing.expectEqual(@as(usize, 13), conn.arena.totalUsed());
 
     // Release (calls reset via pool.release -> conn.reset -> arena.reset)
     pool.release(conn);
 
     // Acquire again and verify arena is fresh
     const conn2 = pool.acquire() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(usize, 0), conn2.arena.totalUsed());
     try std.testing.expectEqual(Chunk.DATA_START, conn2.arena.chunk_offset);
 
     pool.release(conn2);

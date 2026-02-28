@@ -151,9 +151,11 @@ pub const Hub = struct {
             self.hub_greenlet = null;
         }
 
+        // Pool must deinit before recyclers: pool.deinit() calls
+        // arena.reset() which returns chunks/buffers to the recyclers.
+        self.pool.deinit();
         self.recycler.deinit();
         self.buf_recycler.deinit();
-        self.pool.deinit();
         self.ring.deinit();
     }
 
@@ -453,7 +455,7 @@ pub const Hub = struct {
         const buf = conn.arena.currentFreeSlice(max_bytes) orelse {
             py.py_helper_err_set_string(
                 py.py_helper_exc_runtime_error(),
-                "green_recv: request too large (arena exhausted)",
+                "green_recv: out of memory",
             );
             return null;
         };
@@ -1461,7 +1463,6 @@ fn configFromPyDict(dict: ?*PyObject) ArenaConfig {
         .chunk_size = dictGetU32(obj, "chunk_size", d.chunk_size),
         .max_header_size = dictGetU32(obj, "max_header_size", d.max_header_size),
         .max_body_size = dictGetU32(obj, "max_body_size", d.max_body_size),
-        .max_request_size = dictGetU32(obj, "max_request_size", d.max_request_size),
         .max_connections = dictGetU16(obj, "max_connections", d.max_connections),
         .read_timeout_ms = dictGetU32(obj, "read_timeout_ms", d.read_timeout_ms),
         .keepalive_timeout_ms = dictGetU32(obj, "keepalive_timeout_ms", d.keepalive_timeout_ms),
@@ -2413,10 +2414,10 @@ fn raiseBodyTooLarge() ?*PyObject {
     return null;
 }
 
-fn raiseArenaExhausted() ?*PyObject {
+fn raiseOutOfMemory() ?*PyObject {
     py.py_helper_err_set_string(
         py.py_helper_exc_runtime_error(),
-        "arena exhausted",
+        "out of memory",
     );
     return null;
 }
@@ -2438,7 +2439,7 @@ fn raiseRequestTooLarge() ?*PyObject {
 ///
 /// Raises:
 ///   ValueError: Malformed HTTP (400 Bad Request).
-///   RuntimeError: Request too large (413 / 431) or arena exhausted.
+///   RuntimeError: Request too large (413 / 431) or out of memory.
 ///   OSError: Network error.
 pub fn pyHttpReadRequest(
     _: ?*PyObject,
@@ -2499,7 +2500,7 @@ pub fn pyHttpReadRequest(
             .invalid => return raiseValueError(),
             .header_too_large => return raiseHeaderTooLarge(),
             .body_too_large => return raiseBodyTooLarge(),
-            .arena_oom => return raiseArenaExhausted(),
+            .arena_oom => return raiseOutOfMemory(),
         }
     }
 
@@ -2507,7 +2508,7 @@ pub fn pyHttpReadRequest(
     while (true) {
         // Ensure space for recv
         const free = conn.input.reserveFree(RECV_SIZE) catch {
-            return raiseArenaExhausted();
+            return raiseOutOfMemory();
         };
         const recv_len = @min(free.len, RECV_SIZE);
 
@@ -2555,7 +2556,7 @@ pub fn pyHttpReadRequest(
             .invalid => return raiseValueError(),
             .header_too_large => return raiseHeaderTooLarge(),
             .body_too_large => return raiseBodyTooLarge(),
-            .arena_oom => return raiseArenaExhausted(),
+            .arena_oom => return raiseOutOfMemory(),
         }
     }
 }
@@ -2573,7 +2574,7 @@ test "tryParse: simple GET request" {
     defer allocator.destroy(first_chunk);
 
     const config = ArenaConfig.defaults();
-    var arena = RequestArena.init(first_chunk, &recycler, config);
+    var arena = RequestArena.init(first_chunk, &recycler, config.directThreshold());
     defer arena.reset();
 
     const buf = "GET /hello HTTP/1.1\r\nHost: localhost\r\n\r\n";
@@ -2603,7 +2604,7 @@ test "tryParse: POST with body" {
     defer allocator.destroy(first_chunk);
 
     const config = ArenaConfig.defaults();
-    var arena = RequestArena.init(first_chunk, &recycler, config);
+    var arena = RequestArena.init(first_chunk, &recycler, config.directThreshold());
     defer arena.reset();
 
     const buf = "POST /submit HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello";
@@ -2628,7 +2629,7 @@ test "tryParse: incomplete request" {
     defer allocator.destroy(first_chunk);
 
     const config = ArenaConfig.defaults();
-    var arena = RequestArena.init(first_chunk, &recycler, config);
+    var arena = RequestArena.init(first_chunk, &recycler, config.directThreshold());
     defer arena.reset();
 
     const buf = "GET /path HTTP/1.1\r\nHost: local";
@@ -2645,7 +2646,7 @@ test "tryParse: header_too_large" {
     defer allocator.destroy(first_chunk);
 
     const config = ArenaConfig.defaults();
-    var arena = RequestArena.init(first_chunk, &recycler, config);
+    var arena = RequestArena.init(first_chunk, &recycler, config.directThreshold());
     defer arena.reset();
 
     // A simple request with small headers, but we set max_header_size very low
@@ -2663,7 +2664,7 @@ test "tryParse: body_too_large" {
     defer allocator.destroy(first_chunk);
 
     const config = ArenaConfig.defaults();
-    var arena = RequestArena.init(first_chunk, &recycler, config);
+    var arena = RequestArena.init(first_chunk, &recycler, config.directThreshold());
     defer arena.reset();
 
     const buf = "POST / HTTP/1.1\r\nContent-Length: 100\r\n\r\n" ++ "x" ** 100;
@@ -2680,7 +2681,7 @@ test "tryParse: zero-length body (no Content-Length)" {
     defer allocator.destroy(first_chunk);
 
     const config = ArenaConfig.defaults();
-    var arena = RequestArena.init(first_chunk, &recycler, config);
+    var arena = RequestArena.init(first_chunk, &recycler, config.directThreshold());
     defer arena.reset();
 
     const buf = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
@@ -2702,7 +2703,7 @@ test "tryParse: Content-Length: 0" {
     defer allocator.destroy(first_chunk);
 
     const config = ArenaConfig.defaults();
-    var arena = RequestArena.init(first_chunk, &recycler, config);
+    var arena = RequestArena.init(first_chunk, &recycler, config.directThreshold());
     defer arena.reset();
 
     const buf = "POST / HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
@@ -2725,7 +2726,7 @@ test "tryParse: invalid Content-Length" {
     defer allocator.destroy(first_chunk);
 
     const config = ArenaConfig.defaults();
-    var arena = RequestArena.init(first_chunk, &recycler, config);
+    var arena = RequestArena.init(first_chunk, &recycler, config.directThreshold());
     defer arena.reset();
 
     const buf = "POST / HTTP/1.1\r\nContent-Length: abc\r\n\r\n";
@@ -2742,7 +2743,7 @@ test "tryParse: duplicate headers preserved" {
     defer allocator.destroy(first_chunk);
 
     const config = ArenaConfig.defaults();
-    var arena = RequestArena.init(first_chunk, &recycler, config);
+    var arena = RequestArena.init(first_chunk, &recycler, config.directThreshold());
     defer arena.reset();
 
     const buf = "GET / HTTP/1.1\r\nHost: localhost\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\n\r\n";
@@ -2769,7 +2770,7 @@ test "tryParse: Connection close means not keep-alive" {
     defer allocator.destroy(first_chunk);
 
     const config = ArenaConfig.defaults();
-    var arena = RequestArena.init(first_chunk, &recycler, config);
+    var arena = RequestArena.init(first_chunk, &recycler, config.directThreshold());
     defer arena.reset();
 
     const buf = "GET / HTTP/1.1\r\nConnection: close\r\n\r\n";
@@ -2791,7 +2792,7 @@ test "tryParse: HTTP/1.0 default not keep-alive" {
     defer allocator.destroy(first_chunk);
 
     const config = ArenaConfig.defaults();
-    var arena = RequestArena.init(first_chunk, &recycler, config);
+    var arena = RequestArena.init(first_chunk, &recycler, config.directThreshold());
     defer arena.reset();
 
     const buf = "GET / HTTP/1.0\r\nHost: localhost\r\n\r\n";
@@ -2813,7 +2814,7 @@ test "tryParse: incomplete body (Content-Length present but body not fully recei
     defer allocator.destroy(first_chunk);
 
     const config = ArenaConfig.defaults();
-    var arena = RequestArena.init(first_chunk, &recycler, config);
+    var arena = RequestArena.init(first_chunk, &recycler, config.directThreshold());
     defer arena.reset();
 
     const buf = "POST / HTTP/1.1\r\nContent-Length: 10\r\n\r\nhello";
@@ -2830,7 +2831,7 @@ test "tryParse: pipelined requests" {
     defer allocator.destroy(first_chunk);
 
     const config = ArenaConfig.defaults();
-    var arena = RequestArena.init(first_chunk, &recycler, config);
+    var arena = RequestArena.init(first_chunk, &recycler, config.directThreshold());
 
     const buf = "GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n";
 
@@ -2864,7 +2865,7 @@ test "allocSlice: basic typed allocation" {
     defer allocator.destroy(first_chunk);
 
     const config = ArenaConfig.defaults();
-    var arena = RequestArena.init(first_chunk, &recycler, config);
+    var arena = RequestArena.init(first_chunk, &recycler, config.directThreshold());
     defer arena.reset();
 
     const headers = arena.allocSlice(http.Header, 32) orelse return error.TestUnexpectedResult;

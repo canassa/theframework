@@ -571,8 +571,8 @@ def serve(
         _ready: Event set when the server is ready (single-worker only).
         config: Optional configuration dict passed to the Zig hub. Supported
                 keys: max_header_size, max_body_size, max_connections,
-                chunk_size, max_request_size, read_timeout_ms,
-                keepalive_timeout_ms, handler_timeout_ms.
+                chunk_size, read_timeout_ms, keepalive_timeout_ms,
+                handler_timeout_ms.
     """
     if workers == 0:
         workers = os.cpu_count() or 1
