@@ -5,9 +5,6 @@ A fast Python HTTP framework powered by io_uring and greenlets. No async/await�
 ## Folder Structure
 
 - `theframework/` — Python package with main framework code
-  - `app.py` — Framework class and routing
-  - `server.py` — Server and greenlet runtime
-  - `request.py`, `response.py` — HTTP request/response objects
 - `src/` — Zig source for io_uring integration
 - `stubs/` — Type stubs for C extensions
 - `tests/` — Pytest tests
@@ -15,12 +12,17 @@ A fast Python HTTP framework powered by io_uring and greenlets. No async/await�
 - `plans/` — Design and implementation documentation
 - `build.zig` — Zig build script
 
-## Development
+## Commands
 
-- **Python**: 3.13+ (via `uv`)
-- **Zig**: 0.15.2 (via Nix flake)
-- **Type checking**: mypy strict mode
-- **Testing**: pytest
+- `zig build test` — Run Zig tests
+- `zig build` — Build the extension (required before pytest)
+- `uv run pytest tests/` — Run Python tests
+- `uv run mypy` — Run type checker
+- `uv run ruff check` — Run linter
+
+## Rules
+
+- ALWAYS run all tests and type checker after making changes
 
 ## Key Implementation Notes
 
