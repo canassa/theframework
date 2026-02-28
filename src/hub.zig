@@ -11,6 +11,10 @@ const ConnectionPool = conn_mod.ConnectionPool;
 const ConnectionState = conn_mod.ConnectionState;
 const http = @import("http.zig");
 const http_response = @import("http_response.zig");
+const config_mod = @import("config.zig");
+const ArenaConfig = config_mod.ArenaConfig;
+const chunk_pool = @import("chunk_pool.zig");
+const ChunkRecycler = chunk_pool.ChunkRecycler;
 
 const py = @cImport({
     @cInclude("py_helpers.h");
@@ -50,15 +54,20 @@ pub const Hub = struct {
     active_waits: usize, // count of pending I/O operations
     running: bool,
     allocator: std.mem.Allocator,
+    config: ArenaConfig,
+    recycler: ChunkRecycler,
 
-    pub fn init(allocator: std.mem.Allocator) !Hub {
+    pub fn init(allocator: std.mem.Allocator, config: ArenaConfig) !Hub {
         const ring = try Ring.init(256);
         errdefer {
             var r = ring;
             r.deinit();
         }
 
-        var pool = try ConnectionPool.init(allocator);
+        var recycler = ChunkRecycler.init(allocator);
+        errdefer recycler.deinit();
+
+        var pool = try ConnectionPool.init(allocator, config, &recycler);
         errdefer pool.deinit();
 
         var op_slots = try OpSlotTable.init(allocator);
@@ -81,6 +90,8 @@ pub const Hub = struct {
             .active_waits = 0,
             .running = false,
             .allocator = allocator,
+            .config = config,
+            .recycler = recycler,
         };
     }
 
@@ -91,16 +102,13 @@ pub const Hub = struct {
             self.accept_greenlet = null;
         }
 
-        // Decref greenlets in active connections and free buffers
-        for (&self.pool.connections) |*conn| {
+        // Decref greenlets in active connections
+        // (arena cleanup is handled by pool.deinit() -> arena.reset())
+        for (self.pool.connections) |*conn| {
             if (conn.greenlet) |g_opaque| {
                 const g: *PyObject = @ptrCast(@alignCast(g_opaque));
                 py.py_helper_decref(g);
                 conn.greenlet = null;
-            }
-            if (conn.recv_buf) |buf| {
-                self.allocator.free(buf);
-                conn.recv_buf = null;
             }
         }
 
@@ -132,6 +140,7 @@ pub const Hub = struct {
             self.hub_greenlet = null;
         }
 
+        self.recycler.deinit();
         self.pool.deinit();
         self.ring.deinit();
     }
@@ -313,18 +322,30 @@ pub const Hub = struct {
         if (fd_usize < MAX_FDS) {
             self.fd_to_conn[fd_usize] = null;
         }
-        // Free recv buffer if present
-        if (conn.recv_buf) |buf| {
-            self.allocator.free(buf);
-            conn.recv_buf = null;
-        }
         // Decref greenlet if present
         if (conn.greenlet) |g_opaque| {
             const g: *PyObject = @ptrCast(@alignCast(g_opaque));
             py.py_helper_decref(g);
             conn.greenlet = null;
         }
+        // pool.release() calls conn.reset() which calls arena.reset()
         self.pool.release(conn);
+    }
+
+    // -----------------------------------------------------------------------
+    // sendRejectAndClose: send an HTTP error response and close the fd
+    // -----------------------------------------------------------------------
+
+    /// Send a rejection HTTP response (e.g. 503 Service Unavailable) and
+    /// close the file descriptor. Used for connection pool exhaustion and
+    /// other hard-limit violations. Uses blocking posix write (not io_uring)
+    /// since this is a fast-path rejection — the fd is not in the pool.
+    pub fn sendRejectAndClose(_: *Hub, fd: posix.fd_t, status_code: u16) void {
+        const status = statusFromInt(status_code) orelse return;
+        var buf: [256]u8 = undefined;
+        const n = http_response.writeResponse(&buf, status, &.{}, "") catch return;
+        _ = posix.write(fd, buf[0..n]) catch {};
+        posix.close(fd);
     }
 
     // -----------------------------------------------------------------------
@@ -375,14 +396,19 @@ pub const Hub = struct {
         // Register the new fd in the connection pool
         const new_fd: posix.fd_t = @intCast(res);
         const new_fd_usize: usize = @intCast(new_fd);
-        if (new_fd_usize < MAX_FDS) {
-            if (self.pool.acquire()) |conn| {
-                conn.fd = new_fd;
-                conn.state = .idle;
-                self.fd_to_conn[new_fd_usize] = conn.pool_index;
-            }
-            // If pool exhausted, the fd still works but won't be tracked
+        if (new_fd_usize >= MAX_FDS) {
+            self.sendRejectAndClose(new_fd, 503);
+            return py.PyLong_FromLong(@as(c_long, res));
         }
+
+        const conn = self.pool.acquire() orelse {
+            // Pool exhausted — reject with 503 and close the fd
+            self.sendRejectAndClose(new_fd, 503);
+            return py.PyLong_FromLong(@as(c_long, res));
+        };
+        conn.fd = new_fd;
+        conn.state = .idle;
+        self.fd_to_conn[new_fd_usize] = conn.pool_index;
 
         return py.PyLong_FromLong(@as(c_long, res));
     }
@@ -411,17 +437,17 @@ pub const Hub = struct {
             return null;
         };
 
-        // Heap-allocate recv buffer (CRITICAL: greenlet copies C stacks)
-        const buf = self.allocator.alloc(u8, max_bytes) catch {
-            _ = py.py_helper_err_no_memory();
+        // Get writable space from the arena (no heap alloc)
+        const buf = conn.arena.currentFreeSlice(max_bytes) orelse {
+            py.py_helper_err_set_string(
+                py.py_helper_exc_runtime_error(),
+                "green_recv: request too large (arena exhausted)",
+            );
             return null;
         };
-        conn.recv_buf = buf;
 
         // Get current greenlet
         const current = py.py_helper_greenlet_getcurrent() orelse {
-            self.allocator.free(buf);
-            conn.recv_buf = null;
             return null;
         };
 
@@ -429,8 +455,6 @@ pub const Hub = struct {
         const user_data = conn_mod.encodeUserData(conn.pool_index, conn.generation);
         _ = self.ring.prepRecv(fd, buf, user_data) catch {
             py.py_helper_decref(current);
-            self.allocator.free(buf);
-            conn.recv_buf = null;
             py.py_helper_err_set_string(
                 py.py_helper_exc_oserror(),
                 "green_recv: failed to submit recv SQE",
@@ -454,47 +478,33 @@ pub const Hub = struct {
             conn.pending_ops -= 1;
             self.active_waits -= 1;
             py.py_helper_decref(current);
-            self.allocator.free(buf);
-            conn.recv_buf = null;
             return null;
         };
         const switch_result = py.py_helper_greenlet_switch(hub_g, null, null);
         if (switch_result == null) {
-            if (conn.recv_buf) |remaining_buf| {
-                self.allocator.free(remaining_buf);
-                conn.recv_buf = null;
-            }
             return null;
         }
         py.py_helper_decref(switch_result);
 
         // On resume: read result
         const res = conn.result;
-        const recv_buf = conn.recv_buf;
-        conn.recv_buf = null;
 
         if (res < 0) {
-            if (recv_buf) |rbp| {
-                self.allocator.free(rbp);
-            }
             py.py_helper_err_set_from_errno(-res);
             return null;
         }
 
         const nbytes: usize = @intCast(res);
 
-        // Create Python bytes from buffer
-        const py_bytes = py.py_helper_bytes_from_string_and_size(
-            if (recv_buf) |rbp| @ptrCast(rbp.ptr) else null,
+        // Commit the bytes to the arena (advance bump pointer)
+        conn.arena.commitBytes(nbytes);
+
+        // Copy into Python bytes object
+        // No free needed -- arena.reset() handles everything on connection release
+        return py.py_helper_bytes_from_string_and_size(
+            @ptrCast(buf.ptr),
             @intCast(nbytes),
         );
-
-        // Free the heap buffer
-        if (recv_buf) |rbp| {
-            self.allocator.free(rbp);
-        }
-
-        return py_bytes;
     }
 
     // -----------------------------------------------------------------------
@@ -1041,17 +1051,14 @@ pub const Hub = struct {
 
         const conn = &self.pool.connections[pool_idx];
         self.fd_to_conn[fd_usize] = null;
-        // Do NOT close the fd — Python owns it
+        // Do NOT close the fd -- Python owns it
         // But we need to clean up the connection
         if (conn.greenlet) |g_opaque| {
             const g: *PyObject = @ptrCast(@alignCast(g_opaque));
             py.py_helper_decref(g);
             conn.greenlet = null;
         }
-        if (conn.recv_buf) |buf| {
-            self.allocator.free(buf);
-            conn.recv_buf = null;
-        }
+        // pool.release() calls conn.reset() which calls arena.reset()
         self.pool.release(conn);
 
         const none = py.py_helper_none();
@@ -1347,6 +1354,55 @@ fn parseIpv4(host: [*:0]const u8) ?[4]u8 {
 }
 
 // ---------------------------------------------------------------------------
+// Python dict → ArenaConfig parser
+// ---------------------------------------------------------------------------
+
+/// Read an integer value from a Python dict by key. Returns the default
+/// if the dict is null, the key is missing, or the value is not an int.
+fn dictGetU32(dict: *PyObject, key: [*:0]const u8, default: u32) u32 {
+    const item: ?*PyObject = py.PyDict_GetItemString(dict, key);
+    if (item == null) return default;
+    const val = py.PyLong_AsLong(item.?);
+    if (val == -1 and py.py_helper_err_occurred() != null) {
+        py.PyErr_Clear();
+        return default;
+    }
+    if (val < 0) return default;
+    if (val > std.math.maxInt(u32)) return default;
+    return @intCast(val);
+}
+
+fn dictGetU16(dict: *PyObject, key: [*:0]const u8, default: u16) u16 {
+    const item: ?*PyObject = py.PyDict_GetItemString(dict, key);
+    if (item == null) return default;
+    const val = py.PyLong_AsLong(item.?);
+    if (val == -1 and py.py_helper_err_occurred() != null) {
+        py.PyErr_Clear();
+        return default;
+    }
+    if (val < 0) return default;
+    if (val > std.math.maxInt(u16)) return default;
+    return @intCast(val);
+}
+
+/// Parse an ArenaConfig from a Python dict. Missing keys use defaults.
+/// If dict is null, returns all defaults.
+fn configFromPyDict(dict: ?*PyObject) ArenaConfig {
+    const d = ArenaConfig.defaults();
+    const obj = dict orelse return d;
+    return ArenaConfig{
+        .chunk_size = dictGetU32(obj, "chunk_size", d.chunk_size),
+        .max_header_size = dictGetU32(obj, "max_header_size", d.max_header_size),
+        .max_body_size = dictGetU32(obj, "max_body_size", d.max_body_size),
+        .max_request_size = dictGetU32(obj, "max_request_size", d.max_request_size),
+        .max_connections = dictGetU16(obj, "max_connections", d.max_connections),
+        .read_timeout_ms = dictGetU32(obj, "read_timeout_ms", d.read_timeout_ms),
+        .keepalive_timeout_ms = dictGetU32(obj, "keepalive_timeout_ms", d.keepalive_timeout_ms),
+        .handler_timeout_ms = dictGetU32(obj, "handler_timeout_ms", d.handler_timeout_ms),
+    };
+}
+
+// ---------------------------------------------------------------------------
 // Global hub instance (one per process)
 // ---------------------------------------------------------------------------
 
@@ -1360,13 +1416,15 @@ fn getHub() ?*Hub {
 // Python-facing API functions (called from extension.zig)
 // ---------------------------------------------------------------------------
 
-/// hub_run(listen_fd, acceptor_fn) → None
+/// hub_run(listen_fd, acceptor_fn, config_dict=None) → None
 pub fn pyHubRun(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
     var listen_fd_long: c_long = 0;
     var acceptor_fn: ?*PyObject = null;
-    if (py.PyArg_ParseTuple(args, "lO", &listen_fd_long, &acceptor_fn) == 0)
+    var config_dict: ?*PyObject = null;
+    if (py.PyArg_ParseTuple(args, "lO|O", &listen_fd_long, &acceptor_fn, &config_dict) == 0)
         return null;
 
+    const config = configFromPyDict(config_dict);
     const allocator = std.heap.c_allocator;
 
     // Allocate hub on the heap so it survives across greenlet switches
@@ -1374,7 +1432,7 @@ pub fn pyHubRun(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
         _ = py.py_helper_err_no_memory();
         return null;
     };
-    hub_ptr.* = Hub.init(allocator) catch {
+    hub_ptr.* = Hub.init(allocator, config) catch {
         allocator.destroy(hub_ptr);
         py.py_helper_err_set_string(
             py.py_helper_exc_runtime_error(),
@@ -1382,6 +1440,10 @@ pub fn pyHubRun(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
         );
         return null;
     };
+    // Fix up arena recycler pointers: Hub.init() returns by value, so the
+    // recycler moved to hub_ptr.recycler. Arenas still point to the old
+    // (dead) stack address. Re-point them to the final heap address.
+    hub_ptr.pool.fixupRecycler(&hub_ptr.recycler);
     global_hub = hub_ptr;
 
     // The current greenlet IS the hub greenlet
@@ -1780,6 +1842,7 @@ fn statusFromInt(code: u16) ?http_response.StatusCode {
         400 => .bad_request,
         404 => .not_found,
         405 => .method_not_allowed,
+        413 => .payload_too_large,
         431 => .request_header_fields_too_large,
         500 => .internal_server_error,
         503 => .service_unavailable,

@@ -48,19 +48,25 @@ Gap analysis for making theframework production-grade. Since theframework is des
 
 ## Important (Needed for Reliability)
 
-### 4. Multi-Worker / Multi-Process
+### 4. Multi-Worker / Multi-Process ✅ PARTIALLY DONE
 
 **Granian**: `MPServer` with configurable worker count, each running in its own process. Workers are forked/spawned, each with its own event loop. Automatic crash recovery with respawn. Crash loop detection (5.5s window). Configurable `workers_kill_timeout`. RSS memory monitoring with multi-sample threshold before respawn.
 
-**theframework**: Single-process, single-threaded. One hub, one event loop. If the process crashes, the server is down. No way to utilize multiple CPU cores.
+**theframework**: Multi-process worker model implemented. See Phase 7.1 implementation notes in `plans/implementation.md`.
 
-**What's missing**:
-- Multi-process worker model (fork/spawn)
-- Worker crash detection and automatic respawn
-- Crash loop detection
-- Worker lifetime TTL (periodic respawn for leak prevention)
-- RSS memory monitoring with threshold-based respawn
-- Configurable worker count
+**Completed**:
+- [x] Multi-process worker model (fork/spawn) — commit 36bfd13
+- [x] Worker crash detection and automatic respawn — commit 36bfd13
+- [x] Crash loop detection (60s window, 5 crashes threshold) — commit 36bfd13
+- [x] Exponential backoff before respawn (0.1s → 0.2s → 0.4s → ... capped at 5s) — this session
+- [x] Configurable worker count — `workers` parameter to `serve()`
+- [x] Signal handling (SIGTERM/SIGINT graceful shutdown) — this session
+- [x] Comprehensive test coverage (9 prefork tests) — this session
+
+**Still missing**:
+- [ ] Worker lifetime TTL (periodic respawn for leak prevention)
+- [ ] RSS memory monitoring with threshold-based respawn
+- [ ] `workers_kill_timeout` configuration (currently hardcoded to 3s)
 
 ### 5. Connection Error Resilience
 
@@ -225,7 +231,7 @@ The `finally: green_close(fd)` block is good, but the connection pool slot may n
 | **P0** | Graceful shutdown | Medium | Prevents data loss on deploy |
 | **P0** | Handler error catching → 500 | Low | Prevents silent connection drops |
 | **P0** | Logging | Low | Can't operate what you can't see |
-| **P1** | Multi-worker | High | CPU utilization, crash resilience |
+| **P1** | Multi-worker | ✅ DONE | ✅ Implemented + backoff fixes |
 | **P1** | Connection error resilience | Low | Prevents connection leaks |
 | **P1** | Response streaming | Medium | SSE, large responses |
 | **P1** | Backpressure / connection limit | Medium | Defense-in-depth (nginx is primary gate) |

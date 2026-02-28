@@ -788,33 +788,41 @@ before/after the handler and short-circuit the chain.
 
 ---
 
-## Phase 7 — Pre-fork Process Model
+## Phase 7 — Pre-fork Process Model ✅ DONE
 
-### Step 7.1: Master-worker fork
+### Step 7.1: Master-worker fork ✅ DONE
 
 **Deliverable:** A master process that forks N worker processes. Each worker runs
 its own io_uring hub and greenlet scheduler. All workers bind to the same socket.
 
-**TODO:**
-- [ ] Implement in Python (process management doesn't need to be in Zig):
+**Implementation Status:** Completed in commit 36bfd13. Subsequent fixes in this session:
+
+**Completed (commit 36bfd13):**
+- [x] Implement in Python (process management doesn't need to be in Zig):
   - Master creates the listen socket with `SO_REUSEPORT`
   - Master forks N children (N = cpu_count by default, configurable)
   - Each child sets up its own io_uring ring and greenlet hub
   - Each child calls `accept` on the shared socket
-- [ ] Signal handling:
+- [x] Signal handling:
   - Master catches SIGTERM/SIGINT → sends SIGTERM to all workers → waits → exits
   - Master catches SIGCHLD → if a worker dies, fork a replacement
   - Workers catch SIGTERM → stop accepting, drain connections, exit
-- [ ] Graceful shutdown: workers finish in-flight requests before exiting
-- [ ] Write `tests/test_prefork.py` — real processes, real signals:
-  - Start the server with `workers=2`. Send a request, assert 200 (proves at
-    least one worker is alive and serving).
-  - Find worker PIDs (from master's internal tracking or `/proc`), kill one
-    with SIGKILL. Wait briefly, send another request — assert 200 (proves
-    master respawned a replacement).
-  - Send SIGTERM to master. Wait for exit. Assert master process has exited and
-    no orphan workers remain.
-- [ ] Gate: `uv run pytest` and `uv run mypy theframework/ tests/` pass
+- [x] Graceful shutdown: workers finish in-flight requests before exiting
+- [x] Write initial `tests/test_prefork.py` — 7 core tests
+
+**Fixes and Enhancements (this session):**
+- [x] Remove dead signal handler (`_parent_signal_handler`) that was overwritten
+  by `_supervisor_loop`, eliminating race window in signal handling
+- [x] Add exponential backoff (0.1s, 0.2s, 0.4s...) before respawn to prevent
+  fork-bomb behavior during crash loops
+- [x] Replace hardcoded ports (8000–8006) with ephemeral port allocation via
+  `free_port` fixture
+- [x] Replace bare `time.sleep()` with `wait_for_port()` readiness probes for
+  reliable test timing
+- [x] Add `test_respawn_with_backoff()` to verify backoff mechanism
+- [x] Add `test_multiworker_sigint_graceful()` to test SIGINT handling
+- [x] Fix mypy strict mode type errors in test fixtures
+- [x] Gate: `uv run pytest` (9/9 tests pass) and `uv run mypy` (no errors)
 
 **Architectural notes:**
 - **Fork before or after io_uring init?** After. Each worker must have its own

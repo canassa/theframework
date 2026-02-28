@@ -1,5 +1,12 @@
 const std = @import("std");
 const posix = std.posix;
+const arena_mod = @import("arena.zig");
+const RequestArena = arena_mod.RequestArena;
+const chunk_pool = @import("chunk_pool.zig");
+const Chunk = chunk_pool.Chunk;
+const ChunkRecycler = chunk_pool.ChunkRecycler;
+const config_mod = @import("config.zig");
+const ArenaConfig = config_mod.ArenaConfig;
 
 // ---------------------------------------------------------------------------
 // Connection
@@ -17,26 +24,23 @@ pub const Connection = struct {
     fd: posix.fd_t,
     state: ConnectionState,
     generation: u32,
-    recv_buf: ?[]u8,
-    send_buf: ?[]const u8,
-    send_offset: usize,
-    send_total: usize,
-    greenlet: ?*anyopaque, // opaque — caller (hub.zig) handles incref/decref
+    greenlet: ?*anyopaque, // opaque -- caller (hub.zig) handles incref/decref
     pending_ops: u8,
     pool_index: u16,
     result: i32, // CQE result storage
+
+    // Per-connection arena allocator (replaces recv_buf/send_buf)
+    arena: RequestArena,
+    inline_chunk: Chunk, // 4 KB embedded, used as arena's first_chunk
 
     pub fn reset(self: *Connection) void {
         // Note: caller must decref greenlet before calling reset
         self.fd = -1;
         self.state = .idle;
-        self.recv_buf = null;
-        self.send_buf = null;
-        self.send_offset = 0;
-        self.send_total = 0;
         self.greenlet = null;
         self.pending_ops = 0;
         self.result = 0;
+        self.arena.reset();
     }
 };
 
@@ -60,51 +64,64 @@ pub fn decodeGeneration(user_data: u64) u32 {
 // ConnectionPool
 // ---------------------------------------------------------------------------
 
-pub const POOL_SIZE: u16 = 4096;
-
 pub const ConnectionPool = struct {
-    connections: [POOL_SIZE]Connection,
+    connections: []Connection, // heap-allocated, dynamically sized
     free_list: std.ArrayListUnmanaged(u16),
     allocator: std.mem.Allocator,
 
-    pub fn init(allocator: std.mem.Allocator) !ConnectionPool {
-        var pool = ConnectionPool{
-            .connections = undefined,
-            .free_list = .{},
-            .allocator = allocator,
-        };
+    pub fn init(
+        allocator: std.mem.Allocator,
+        config: ArenaConfig,
+        recycler: *ChunkRecycler,
+    ) !ConnectionPool {
+        const max_conns: usize = config.max_connections;
+        const connections = try allocator.alloc(Connection, max_conns);
+        errdefer allocator.free(connections);
 
         // Initialize all connections
-        for (0..POOL_SIZE) |i| {
+        for (0..max_conns) |i| {
             const idx: u16 = @intCast(i);
-            pool.connections[i] = Connection{
+            connections[i] = Connection{
                 .fd = -1,
                 .state = .idle,
                 .generation = 0,
-                .recv_buf = null,
-                .send_buf = null,
-                .send_offset = 0,
-                .send_total = 0,
                 .greenlet = null,
                 .pending_ops = 0,
                 .pool_index = idx,
                 .result = 0,
+                .inline_chunk = undefined,
+                .arena = undefined,
             };
+            connections[i].arena = RequestArena.init(
+                &connections[i].inline_chunk,
+                recycler,
+                config,
+            );
         }
 
         // Pre-populate free list (all slots are free)
-        try pool.free_list.ensureTotalCapacity(allocator, POOL_SIZE);
-        var i: u16 = POOL_SIZE;
+        var free_list = std.ArrayListUnmanaged(u16){};
+        try free_list.ensureTotalCapacity(allocator, max_conns);
+        var i: u16 = @intCast(max_conns);
         while (i > 0) {
             i -= 1;
-            pool.free_list.appendAssumeCapacity(i);
+            free_list.appendAssumeCapacity(i);
         }
 
-        return pool;
+        return ConnectionPool{
+            .connections = connections,
+            .free_list = free_list,
+            .allocator = allocator,
+        };
     }
 
     pub fn deinit(self: *ConnectionPool) void {
         // Note: caller must decref any remaining greenlets before deinit
+        // Reset all arenas to return chunks to recycler and free directs
+        for (self.connections) |*conn| {
+            conn.arena.reset();
+        }
+        self.allocator.free(self.connections);
         self.free_list.deinit(self.allocator);
     }
 
@@ -123,7 +140,7 @@ pub const ConnectionPool = struct {
     /// invalidate any stale CQEs. Caller must decref greenlet first.
     pub fn release(self: *ConnectionPool, conn: *Connection) void {
         conn.generation +%= 1; // wrapping add
-        conn.reset();
+        conn.reset(); // calls arena.reset()
         self.free_list.append(self.allocator, conn.pool_index) catch {
             // If this fails, we leak a slot. Acceptable for now.
         };
@@ -135,7 +152,7 @@ pub const ConnectionPool = struct {
         const pool_index = decodePoolIndex(user_data);
         const generation = decodeGeneration(user_data);
 
-        if (pool_index >= POOL_SIZE) return null;
+        if (pool_index >= self.connections.len) return null;
 
         const conn = &self.connections[pool_index];
         if (conn.generation != generation) return null;
@@ -143,9 +160,19 @@ pub const ConnectionPool = struct {
         return conn;
     }
 
+    /// Fix up all arena recycler pointers to point to the given recycler.
+    /// Must be called after the Hub (which owns the recycler) is placed at
+    /// its final address, because Hub.init() returns by value and the
+    /// recycler moves to a new address on assignment.
+    pub fn fixupRecycler(self: *ConnectionPool, recycler: *ChunkRecycler) void {
+        for (self.connections) |*conn| {
+            conn.arena.recycler = recycler;
+        }
+    }
+
     /// How many connections are currently in use.
     pub fn activeCount(self: *ConnectionPool) usize {
-        return POOL_SIZE - self.free_list.items.len;
+        return self.connections.len - self.free_list.items.len;
     }
 };
 
@@ -171,7 +198,13 @@ test "user_data encode/decode max values" {
 
 test "ConnectionPool acquire and release" {
     const allocator = std.testing.allocator;
-    var pool = try ConnectionPool.init(allocator);
+
+    var recycler = ChunkRecycler.init(allocator);
+    defer recycler.deinit();
+
+    var config = ArenaConfig.defaults();
+    config.max_connections = 64; // small pool for testing
+    var pool = try ConnectionPool.init(allocator, config, &recycler);
     defer pool.deinit();
 
     // All slots should be free initially
@@ -189,7 +222,7 @@ test "ConnectionPool acquire and release" {
     pool.release(conn1);
     try std.testing.expectEqual(@as(usize, 0), pool.activeCount());
 
-    // Acquire again — should get the same slot but incremented generation
+    // Acquire again -- should get the same slot but incremented generation
     const conn2 = pool.acquire() orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(idx1, conn2.pool_index);
     try std.testing.expectEqual(gen1 +% 1, conn2.generation);
@@ -199,7 +232,13 @@ test "ConnectionPool acquire and release" {
 
 test "ConnectionPool acquire N, release all, acquire N again" {
     const allocator = std.testing.allocator;
-    var pool = try ConnectionPool.init(allocator);
+
+    var recycler = ChunkRecycler.init(allocator);
+    defer recycler.deinit();
+
+    var config = ArenaConfig.defaults();
+    config.max_connections = 64;
+    var pool = try ConnectionPool.init(allocator, config, &recycler);
     defer pool.deinit();
 
     const N = 50;
@@ -224,7 +263,7 @@ test "ConnectionPool acquire N, release all, acquire N again" {
     }
     try std.testing.expectEqual(@as(usize, 0), pool.activeCount());
 
-    // Acquire N again — generations should be incremented
+    // Acquire N again -- generations should be incremented
     for (0..N) |i| {
         conns[i] = pool.acquire() orelse return error.TestUnexpectedResult;
     }
@@ -244,7 +283,13 @@ test "ConnectionPool acquire N, release all, acquire N again" {
 
 test "ConnectionPool lookup validates generation" {
     const allocator = std.testing.allocator;
-    var pool = try ConnectionPool.init(allocator);
+
+    var recycler = ChunkRecycler.init(allocator);
+    defer recycler.deinit();
+
+    var config = ArenaConfig.defaults();
+    config.max_connections = 64;
+    var pool = try ConnectionPool.init(allocator, config, &recycler);
     defer pool.deinit();
 
     // Acquire a connection
@@ -267,14 +312,52 @@ test "ConnectionPool lookup validates generation" {
 
 test "ConnectionPool exhaustion" {
     const allocator = std.testing.allocator;
-    var pool = try ConnectionPool.init(allocator);
+
+    var recycler = ChunkRecycler.init(allocator);
+    defer recycler.deinit();
+
+    var config = ArenaConfig.defaults();
+    config.max_connections = 8; // tiny pool
+    var pool = try ConnectionPool.init(allocator, config, &recycler);
     defer pool.deinit();
 
     // Exhaust all slots
-    for (0..POOL_SIZE) |_| {
+    for (0..8) |_| {
         _ = pool.acquire() orelse return error.TestUnexpectedResult;
     }
 
     // Next acquire should return null
     try std.testing.expect(pool.acquire() == null);
+}
+
+test "Connection arena integration: alloc, reset, reuse" {
+    const allocator = std.testing.allocator;
+
+    var recycler = ChunkRecycler.init(allocator);
+    defer recycler.deinit();
+
+    var config = ArenaConfig.defaults();
+    config.max_connections = 4;
+    var pool = try ConnectionPool.init(allocator, config, &recycler);
+    defer pool.deinit();
+
+    // Acquire a connection
+    const conn = pool.acquire() orelse return error.TestUnexpectedResult;
+
+    // Use the arena (simulating currentFreeSlice + commitBytes for recv)
+    const slice = conn.arena.currentFreeSlice(256) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 256), slice.len);
+    @memset(slice[0..13], 'H');
+    conn.arena.commitBytes(13);
+    try std.testing.expectEqual(@as(usize, 13), conn.arena.totalUsed());
+
+    // Release (calls reset via pool.release -> conn.reset -> arena.reset)
+    pool.release(conn);
+
+    // Acquire again and verify arena is fresh
+    const conn2 = pool.acquire() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 0), conn2.arena.totalUsed());
+    try std.testing.expectEqual(Chunk.DATA_START, conn2.arena.chunk_offset);
+
+    pool.release(conn2);
 }

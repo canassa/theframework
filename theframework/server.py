@@ -86,8 +86,37 @@ def _create_listen_socket(
 # ---------------------------------------------------------------------------
 
 
-def _handle_connection(fd: int, handler: HandlerFunc) -> None:
+def _send_error(fd: int, status_code: int) -> None:
+    """Send an HTTP error response and close the connection.
+
+    Best-effort: if the fd is already closed or the send fails, we just
+    swallow the exception and move on.
+    """
+    reason = {
+        413: "Payload Too Large",
+        431: "Request Header Fields Too Large",
+        503: "Service Unavailable",
+    }.get(status_code, "Error")
+
+    response = f"HTTP/1.1 {status_code} {reason}\r\nContent-Length: 0\r\n\r\n".encode()
+    try:
+        _framework_core.green_send(fd, response)
+    except Exception:
+        pass  # Best effort, fd might be closed already
+    finally:
+        try:
+            _framework_core.green_close(fd)
+        except Exception:
+            pass
+
+
+def _handle_connection(
+    fd: int, handler: HandlerFunc, config: dict[str, int] | None = None,
+) -> None:
     """Per-connection greenlet: recv -> parse -> Request/Response -> handler -> finalize."""
+    cfg = config or {}
+    max_header_size = cfg.get("max_header_size", 32768)
+    max_body_size = cfg.get("max_body_size", 1_048_576)
     buf = b""
     try:
         while True:
@@ -105,6 +134,17 @@ def _handle_connection(fd: int, handler: HandlerFunc) -> None:
                 raw_bytes = buf[:consumed]
                 buf = buf[consumed:]
 
+                # Check header size (consumed bytes minus body = headers + request line)
+                header_bytes = consumed - len(body)
+                if header_bytes > max_header_size:
+                    _send_error(fd, 431)
+                    return
+
+                # Check body size
+                if len(body) > max_body_size:
+                    _send_error(fd, 413)
+                    return
+
                 request = Request._from_raw(method, path, body, raw_bytes)
                 response = Response(fd)
 
@@ -114,13 +154,29 @@ def _handle_connection(fd: int, handler: HandlerFunc) -> None:
                 if not keep_alive:
                     _framework_core.green_close(fd)
                     return
+    except RuntimeError as e:
+        # Arena exhaustion (request too large for configured limits)
+        if "arena exhausted" in str(e) or "too large" in str(e):
+            try:
+                _send_error(fd, 413)
+            except Exception:
+                pass
+            return
+        raise
     except OSError:
         pass
     finally:
-        _framework_core.green_close(fd)
+        try:
+            _framework_core.green_close(fd)
+        except Exception:
+            pass
 
 
-def _run_acceptor(listen_fd: int, handler: HandlerFunc) -> None:
+def _run_acceptor(
+    listen_fd: int,
+    handler: HandlerFunc,
+    config: dict[str, int] | None = None,
+) -> None:
     """Accept connections and spawn handler greenlets."""
     while True:
         try:
@@ -137,7 +193,8 @@ def _run_acceptor(listen_fd: int, handler: HandlerFunc) -> None:
             break
         hub_g = _framework_core.get_hub_greenlet()
         g = greenlet.greenlet(
-            lambda fd=client_fd: _handle_connection(fd, handler), parent=hub_g
+            lambda fd=client_fd: _handle_connection(fd, handler, config),
+            parent=hub_g,
         )
         _framework_core.hub_schedule(g)
 
@@ -173,7 +230,11 @@ def _signal_watcher(sig_read_fd: int) -> None:
 
 
 def _worker_main(
-    worker_id: int, handler: HandlerFunc, host: str, port: int
+    worker_id: int,
+    handler: HandlerFunc,
+    host: str,
+    port: int,
+    config: dict[str, int] | None = None,
 ) -> None:
     """Entry point for a forked worker process."""
     # 1. Reset signals - allow graceful shutdown via SIGTERM
@@ -199,9 +260,9 @@ def _worker_main(
         def _acceptor() -> None:
             hub_g = _framework_core.get_hub_greenlet()
             mark_hub_running(hub_g)
-            _run_acceptor(listen_fd, handler)
+            _run_acceptor(listen_fd, handler, config)
 
-        _framework_core.hub_run(listen_fd, _acceptor)
+        _framework_core.hub_run(listen_fd, _acceptor, config)
     except Exception as e:
         _log(f"hub exited with error: {e}", worker_id=worker_id)
         _log(traceback.format_exc(), worker_id=worker_id)
@@ -223,6 +284,7 @@ def _serve_single(
     port: int,
     *,
     _ready: threading.Event | None = None,
+    config: dict[str, int] | None = None,
 ) -> None:
     """Single-worker mode: no fork, current behavior."""
     sock = _create_listen_socket(host, port, reuseport=False)
@@ -238,9 +300,9 @@ def _serve_single(
         def _acceptor_with_mark() -> None:
             hub_g = _framework_core.get_hub_greenlet()
             mark_hub_running(hub_g)
-            _run_acceptor(listen_fd, handler)
+            _run_acceptor(listen_fd, handler, config)
 
-        _framework_core.hub_run(listen_fd, _acceptor_with_mark)
+        _framework_core.hub_run(listen_fd, _acceptor_with_mark, config)
     finally:
         mark_hub_stopped()
         sock.close()
@@ -302,6 +364,7 @@ def _supervisor_loop(
     port: int,
     num_workers: int,
     shutdown_timeout: float,
+    config: dict[str, int] | None = None,
 ) -> None:
     """Monitor children, respawn on crash, coordinate shutdown.
 
@@ -416,7 +479,7 @@ def _supervisor_loop(
                 new_pid = os.fork()
                 if new_pid == 0:
                     # Child process: _worker_main will set up signal handlers
-                    _worker_main(worker_id, handler, host, port)
+                    _worker_main(worker_id, handler, host, port, config=config)
                     os._exit(0)
                 children[new_pid] = worker_id
                 _log(f"worker {worker_id}: respawned as pid {new_pid}")
@@ -443,7 +506,12 @@ def _supervisor_loop(
 
 
 def _serve_prefork(
-    handler: HandlerFunc, host: str, port: int, *, workers: int
+    handler: HandlerFunc,
+    host: str,
+    port: int,
+    *,
+    workers: int,
+    config: dict[str, int] | None = None,
 ) -> None:
     """Multi-worker mode: fork N children, each with SO_REUSEPORT."""
     global _shutting_down
@@ -459,14 +527,15 @@ def _serve_prefork(
             pid = os.fork()
             if pid == 0:
                 # Child process: _worker_main will set up signal handlers
-                _worker_main(worker_id, handler, host, port)
+                _worker_main(worker_id, handler, host, port, config=config)
                 os._exit(0)  # Should not reach here
             children[pid] = worker_id
             _log(f"worker {worker_id}: forked as pid {pid}")
 
         # Enter supervisor loop
         _supervisor_loop(
-            children, handler, host, port, workers, SHUTDOWN_TIMEOUT
+            children, handler, host, port, workers, SHUTDOWN_TIMEOUT,
+            config=config,
         )
     except KeyboardInterrupt:
         _log("interrupted by user")
@@ -488,6 +557,7 @@ def serve(
     *,
     workers: int = 1,
     _ready: threading.Event | None = None,
+    config: dict[str, int] | None = None,
 ) -> None:
     """Start the HTTP server.
 
@@ -498,13 +568,17 @@ def serve(
         workers: Number of worker processes. Defaults to 1 (single-process,
                  no fork). Set to 0 to auto-detect from CPU count.
         _ready: Event set when the server is ready (single-worker only).
+        config: Optional configuration dict passed to the Zig hub. Supported
+                keys: max_header_size, max_body_size, max_connections,
+                chunk_size, max_request_size, read_timeout_ms,
+                keepalive_timeout_ms, handler_timeout_ms.
     """
     if workers == 0:
         workers = os.cpu_count() or 1
 
     if workers == 1:
-        _serve_single(handler, host, port, _ready=_ready)
+        _serve_single(handler, host, port, _ready=_ready, config=config)
     else:
         if _ready is not None:
             raise ValueError("_ready is not supported with workers > 1")
-        _serve_prefork(handler, host, port, workers=workers)
+        _serve_prefork(handler, host, port, workers=workers, config=config)

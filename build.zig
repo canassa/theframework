@@ -118,12 +118,13 @@ pub fn build(b: *std.Build) void {
     });
     const run_ring_tests = b.addRunArtifact(ring_tests);
 
-    // Tests for connection.zig
+    // Tests for connection.zig (needs link_libc for arena's c_allocator)
     const conn_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/connection.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
         }),
     });
     const run_conn_tests = b.addRunArtifact(conn_tests);
@@ -158,6 +159,36 @@ pub fn build(b: *std.Build) void {
     });
     const run_op_slot_tests = b.addRunArtifact(op_slot_tests);
 
+    // Tests for config.zig (arena config)
+    const config_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/config.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_config_tests = b.addRunArtifact(config_tests);
+
+    // Tests for chunk_pool.zig (chunk recycler)
+    const chunk_pool_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/chunk_pool.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_chunk_pool_tests = b.addRunArtifact(chunk_pool_tests);
+
+    // Tests for arena.zig (per-connection request arena)
+    const arena_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/arena.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const arena_tests = b.addTest(.{ .root_module = arena_test_mod });
+    const run_arena_tests = b.addRunArtifact(arena_tests);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_ring_tests.step);
@@ -165,4 +196,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_http_tests.step);
     test_step.dependOn(&run_http_resp_tests.step);
     test_step.dependOn(&run_op_slot_tests.step);
+    test_step.dependOn(&run_config_tests.step);
+    test_step.dependOn(&run_chunk_pool_tests.step);
+    test_step.dependOn(&run_arena_tests.step);
 }

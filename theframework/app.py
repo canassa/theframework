@@ -104,7 +104,14 @@ class Framework:
         return handler
 
     def run(
-        self, host: str = "127.0.0.1", port: int = 8000, *, workers: int = 1
+        self,
+        host: str = "127.0.0.1",
+        port: int = 8000,
+        *,
+        workers: int = 1,
+        max_header_size: int = 32768,
+        max_body_size: int = 1_048_576,
+        max_connections: int = 4096,
     ) -> None:
         """Start the server.
 
@@ -113,8 +120,16 @@ class Framework:
             port: Port to bind to.
             workers: Number of worker processes. 1 = single-process (default).
                      0 = auto-detect from CPU count.
+            max_header_size: Maximum size of HTTP headers in bytes (default 32 KB).
+            max_body_size: Maximum size of request body in bytes (default 1 MB).
+            max_connections: Maximum concurrent connections (default 4096).
         """
-        serve(self._make_handler(), host, port, workers=workers)
+        config = {
+            "max_header_size": max_header_size,
+            "max_body_size": max_body_size,
+            "max_connections": max_connections,
+        }
+        serve(self._make_handler(), host, port, workers=workers, config=config)
 
 
 def _build_chain(middlewares: list[MiddlewareFunc], handler: HandlerFunc) -> HandlerFunc:
