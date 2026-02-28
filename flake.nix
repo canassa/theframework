@@ -16,8 +16,6 @@
           packages = with pkgs; [
             uv
             zig
-            liburing
-            liburing.dev
             pkg-config
           ];
         };
