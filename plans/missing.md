@@ -6,43 +6,48 @@ Gap analysis for making theframework production-grade. Since theframework is des
 
 ## Critical (Must-Have for Production)
 
-### 1. Graceful Shutdown
+### 1. Graceful Shutdown ✅ PARTIALLY DONE
 
 **Granian**: Full two-phase shutdown chain. `SIGINT`/`SIGTERM` → stop accepting → `graceful_shutdown()` on all active connections → drain in-flight requests → wait for all handlers to complete → cleanup. Kill timeout with `SIGKILL` fallback. Connections are notified via `Notify::notify_waiters()`, and each connection finishes its current request before closing.
 
-**theframework**: `hub_stop()` writes a byte to a pipe, which stops the hub loop. But there is **no draining of in-flight requests**. When the hub loop exits, active greenlets are simply abandoned — their connections are closed mid-request. The `_handle_connection` greenlets have no way to know shutdown is happening.
+**theframework**: Multi-worker graceful shutdown implemented. Signal handlers catch SIGINT/SIGTERM, supervisor sends SIGTERM to workers, waits `SHUTDOWN_TIMEOUT` (3.0s), then SIGKILL fallback.
 
-**What's missing**:
-- Signal handlers (`SIGINT`, `SIGTERM`, `SIGHUP`)
-- Stop accepting new connections while finishing in-flight ones
-- Per-connection shutdown notification (equivalent to granian's `connsig.notify_waiters()`)
-- Configurable drain timeout before force-killing connections
-- Clean greenlet teardown during shutdown
+**Completed**:
+- [x] Signal handlers (`SIGINT`, `SIGTERM`) — `server.py:_signal_watcher` greenlet
+- [x] Two-phase shutdown: SIGTERM → wait → SIGKILL fallback in supervisor
+- [x] `hub_stop()` pipe-based signaling from any thread
 
-### 2. Error Handling in Request Handlers
+**Still missing**:
+- [ ] Hub-level in-flight request draining — when hub loop exits, active greenlets are abandoned mid-request
+- [ ] Per-connection shutdown notification (equivalent to granian's `connsig.notify_waiters()`)
+- [ ] Configurable drain timeout (currently hardcoded `SHUTDOWN_TIMEOUT = 3.0s`)
 
-**Granian**: Python exceptions in ASGI/WSGI callbacks are caught, logged with full tracebacks (`log_application_callable_exception`), and converted to 500 responses. The connection is never corrupted — the client always gets a valid HTTP response.
+### 2. Error Handling in Request Handlers ✅ DONE
 
-**theframework**: In `server.py:_handle_connection`, the handler is called bare — `handler(request, response)`. If the handler raises an exception, it propagates up to the `except OSError: pass` block which only catches OS errors, or crashes the greenlet entirely. The client gets **no response** (connection just drops), and the exception may be silently swallowed.
+**Status**: FIXED. Handler exceptions are now caught and return proper HTTP error responses.
 
-**What's missing**:
-- `try/except` around handler invocation
-- Return a proper `500 Internal Server Error` response on exception
-- Log the exception with traceback
-- Ensure the connection is always properly closed after an error
+- `try/except` around handler invocation (`server.py:_handle_connection`)
+- 500 Internal Server Error on unhandled exceptions via `_try_send_error(fd, 500)`
+- 400 Bad Request on `ValueError` (malformed HTTP)
+- 413/431 on `RuntimeError` (size violations)
+- `finally` block ensures `green_close(fd)` is always called
+- Exception tracebacks logged via `traceback.format_exc()`
 
-### 3. Logging
+### 3. Logging ✅ PARTIALLY DONE
 
 **Granian**: Structured logging via Python `logging`, configurable log levels, access logging with format string (`[time] addr - "method path protocol" status duration_ms`), application exception logging with tracebacks, `pyo3_log` bridge for Rust-side logging.
 
-**theframework**: No logging at all. No access logging, no error logging, no startup messages.
+**theframework**: Supervisor/worker lifecycle logging implemented via `_log()` function.
 
-**What's missing**:
-- Access logging (method, path, status, duration)
-- Error logging (handler exceptions, connection errors)
-- Startup logging (listening address, configuration)
-- Configurable log level and format
-- Integration with Python `logging` module
+**Completed**:
+- [x] Startup logging (listening address, worker count)
+- [x] Worker lifecycle logging (spawn, crash, respawn, shutdown)
+- [x] Error logging for handler exceptions (traceback via `traceback.format_exc()`)
+
+**Still missing**:
+- [ ] Access logging (method, path, status, duration)
+- [ ] Configurable log level and format
+- [ ] Integration with Python `logging` module (currently uses `_log()` helper printing to stderr)
 
 ---
 
@@ -115,21 +120,15 @@ The `finally: green_close(fd)` block is good, but the connection pool slot may n
 - [ ] Active backpressure: stop accepting when approaching capacity (currently accepts and rejects)
 - [ ] Per-worker permit tracking (requires multi-threaded coordination)
 
-### 8. Request Header Access in Zig Parser ⏳ PLANNED
+### 8. Request Header Access in Zig Parser ✅ DONE
 
-**Granian**: Full header access — all headers are parsed and available to the protocol layer. Headers are used for connection management, content negotiation, WebSocket upgrades, etc.
+**Status**: FIXED. Headers are now parsed once in Zig and passed directly to Python as `list[tuple[bytes, bytes]]`.
 
-**theframework**: The Zig HTTP parser (`http.zig`) parses headers into a 64-header array, but `pyHttpParseRequest` only returns `(method, path, body, consumed, keep_alive)`. Headers are then **re-parsed in Python** from the raw bytes (`request.py:_from_raw`). This means:
-1. Headers are parsed twice (once in Zig, once in Python)
-2. The Python re-parsing is fragile (splits on `b"\r\n\r\n"` then `b": "`)
-3. Duplicate headers are silently dropped (dict overwrites)
-
-**Status**: Documented in `plans/headers.md`. Implementation planned as separate phase after arena allocator stabilization.
-
-**What's needed**:
-- Pass parsed headers from Zig to Python directly (avoid double parsing)
-- Support for duplicate headers (e.g., `Set-Cookie` can appear multiple times)
-- Header value validation
+- `http_read_request()` returns 5-tuple: `(method, path, body, keep_alive, headers)`
+- `Request._from_parsed()` receives pre-parsed headers (no re-parsing from raw bytes)
+- Duplicate headers preserved via `raw_headers` property (list of tuples)
+- ASGI-compatible header format `list[tuple[bytes, bytes]]`
+- See `plans/headers.md` for design details
 
 ---
 
@@ -232,23 +231,23 @@ The `finally: green_close(fd)` block is good, but the connection pool slot may n
 
 ## Summary Priority Matrix
 
-| Priority | Feature | Effort | Impact |
-|----------|---------|--------|--------|
-| **P0** | Graceful shutdown | Medium | Prevents data loss on deploy |
-| **P0** | Handler error catching → 500 | Low | Prevents silent connection drops |
-| **P0** | Logging | Low | Can't operate what you can't see |
-| **P1** | Multi-worker | ✅ DONE | ✅ Implemented + backoff fixes |
-| **P1** | Connection error resilience | Low | Prevents connection leaks |
-| **P1** | Response streaming | Medium | SSE, large responses |
-| **P1** | Backpressure / connection limit | Medium | Defense-in-depth (nginx is primary gate) |
-| **P1** | Pass headers from Zig (no double parse) | Medium | Performance, correctness |
-| **P2** | WebSocket | High | Real-time features |
-| **P2** | Metrics | Medium | Production observability |
-| **P2** | Hot reload | Medium | Developer experience |
-| **P2** | Configuration system | Medium | Operational flexibility |
-| **P2** | Lifecycle hooks | Low | App initialization/teardown |
-| **P2** | PID file | Trivial | Process management |
-| **P3** | io_uring ZC RX | High | Eliminate last recv copy (datacenter NIC required, kernel 6.15+) |
+| Priority | Feature | Effort | Impact | Status |
+|----------|---------|--------|--------|--------|
+| **P0** | Graceful shutdown | Medium | Prevents data loss on deploy | ✅ PARTIALLY DONE |
+| **P0** | Handler error catching → 500 | Low | Prevents silent connection drops | ✅ DONE |
+| **P0** | Logging | Low | Can't operate what you can't see | ✅ PARTIALLY DONE |
+| **P1** | Multi-worker | ✅ DONE | ✅ Implemented + backoff fixes | ✅ DONE |
+| **P1** | Connection error resilience | Low | Prevents connection leaks | ✅ PARTIALLY DONE |
+| **P1** | Response streaming | Medium | SSE, large responses | Open |
+| **P1** | Backpressure / connection limit | Medium | Defense-in-depth (nginx is primary gate) | ✅ PARTIALLY DONE |
+| **P1** | Pass headers from Zig (no double parse) | Medium | Performance, correctness | ✅ DONE |
+| **P2** | WebSocket | High | Real-time features | Open |
+| **P2** | Metrics | Medium | Production observability | Open |
+| **P2** | Hot reload | Medium | Developer experience | Open |
+| **P2** | Configuration system | Medium | Operational flexibility | Open |
+| **P2** | Lifecycle hooks | Low | App initialization/teardown | Open |
+| **P2** | PID file | Trivial | Process management | Open |
+| **P3** | io_uring ZC RX | High | Eliminate last recv copy (datacenter NIC required, kernel 6.15+) | Open |
 
 ---
 ---
@@ -265,24 +264,11 @@ noted where they still matter.
 
 ## P0 — Bugs / Will Bite You in Production
 
-### Q1. Request buffer accumulation is O(n²)
+### Q1. Request buffer accumulation is O(n²) ✅ FIXED
 
-**File:** `server.py:19-26`
-
-```python
-buf = b""
-while True:
-    data = _framework_core.green_recv(fd, 8192)
-    buf += data  # ← creates a NEW bytes object every iteration
-```
-
-Python `bytes` is immutable. `buf += data` copies the entire existing buffer plus the new data
-into a fresh allocation every time. A 1MB POST body arriving in 128 recv calls copies ~64MB total.
-
-**Granian** uses hyper's streaming body with `Arc<AsyncMutex<BodyStream>>` — zero accumulation
-copies.
-
-**Fix:** Use `bytearray` or `list[bytes]` with a single `b"".join()` at parse time.
+**Status**: FIXED. Request accumulation moved entirely to Zig. `server.py` no longer has a
+`buf += data` loop — it calls `http_read_request()` which handles all recv + parsing in Zig
+using the per-connection arena (bump allocation, no realloc copies).
 
 ### Q2. Pool exhaustion silently loses connections (fd leak) ✅ FIXED
 
@@ -388,69 +374,36 @@ and reject fds that can't be tracked.
 
 ## P1 — Performance / Correctness Issues
 
-### Q7. Every recv allocates and frees a heap buffer
+### Q7. Every recv allocates and frees a heap buffer ✅ PARTIALLY FIXED
 
-**File:** `hub.zig:415-497`
+**Status**: The main request path (`http_read_request`) now uses arena scratch space instead of
+malloc/free per recv. The arena's `currentFreeSlice()` provides a reusable buffer, and
+`commitBytes()` advances the bump pointer — no heap allocation per recv.
 
-```zig
-const buf = self.allocator.alloc(u8, max_bytes) catch { ... };
-// ... submit recv, switch to hub, resume ...
-const py_bytes = py.py_helper_bytes_from_string_and_size(...);
-self.allocator.free(buf);
-```
+`green_recv` (used by monkey-patched sockets) still allocates/frees per call, but the hot path
+(HTTP request reading) avoids it entirely.
 
-Every `green_recv` call: (1) heap-allocates max_bytes (8192), (2) io_uring fills it, (3) copies
-into a Python bytes object, (4) frees the buffer. That's **2 allocations + 1 copy per recv**. For
-a keep-alive connection handling 1000 requests, that's 2000+ malloc/free calls just for recv
-buffers.
+**Remaining**: Could use io_uring buffer groups (`initBufferGroup` in `ring.zig`) for true
+zero-copy recv on the monkey-patched socket path.
 
-**Granian** avoids this with hyper's internal buffer management and zero-copy `Bytes` types.
+### Q8. Response building is pure Python string concatenation ✅ FIXED
 
-**Fix:** Use a per-connection reusable recv buffer, or use io_uring buffer groups
-(`initBufferGroup` is already implemented in `ring.zig` but unused).
+**Status**: FIXED in response-formatting phase. See `plans/response-formatting.md`.
 
-### Q8. Response building is pure Python string concatenation
+`response.py:_finalize()` now calls `http_send_response(fd, status, headers, body)` which:
+1. Estimates header size via `estimateHeaderSize()` (mirrors H2O's `flatten_headers_estimate_size`)
+2. Allocates from the per-connection arena (bump allocation, no malloc)
+3. Formats headers via `writeResponseHead()` in Zig
+4. Sends headers + body via a single io_uring writev SQE — body is zero-copy (sent directly from Python bytes buffer)
 
-**File:** `response.py:55-75`
+Deleted: `formatLargeResponse()`, `pyHttpFormatResponseFull()`, the 64KB stack buffer, and the magic number `256 + headers.len * 128 + body.len`.
 
-```python
-parts: list[str] = [f"HTTP/1.1 {self.status} {reason}\r\n"]
-for name, value in self._headers.items():
-    parts.append(f"{name}: {value}\r\n")
-parts.append("\r\n")
-raw = "".join(parts).encode("latin-1") + body
-```
+### Q9. Headers parsed twice (Zig then Python) ✅ FIXED
 
-This creates: N f-strings, a list, a joined string, a latin-1 encoded bytes, then concatenates
-with body. That's **5+ intermediate allocations** per response. The Zig-side
-`http_response.writeResponse` exists and writes directly into a buffer, but it's only used by
-`pyHttpFormatResponse` which is **never called** by the Python response path.
-
-**Granian** builds responses entirely in Rust with `Response::builder()`.
-
-**Fix:** Use the Zig response writer from Python, or at minimum use `bytearray` to build the
-response in-place.
-
-### Q9. Headers parsed twice (Zig then Python)
-
-**File:** `hub.zig:1808-1821` → `request.py:48-55`
-
-Zig's `parseRequestFull` parses all headers into a 64-header array, resolves keep-alive, then
-**throws away all headers** and only returns `(method, path, body, consumed, keep_alive)`. Python
-then re-parses the raw bytes:
-
-```python
-header_section, _, _ = raw_bytes.partition(b"\r\n\r\n")
-lines = header_section.split(b"\r\n")
-for line in lines[1:]:
-    if b": " in line:
-        name, _, value = line.partition(b": ")
-```
-
-This Python parsing is both slower and less correct than the Zig parser:
-- Splits on `b": "` (with space) not `b":"` — headers without a space after the colon are dropped
-- Duplicate headers are silently overwritten (dict)
-- No validation of header names or values
+**Status**: FIXED. Headers are now parsed once in Zig and passed to Python as
+`list[tuple[bytes, bytes]]`. The old `_from_raw()` method with its fragile Python-side
+re-parsing has been replaced by `_from_parsed()` which receives pre-parsed headers directly.
+See item #8 above and `plans/headers.md`.
 
 ### Q10. No TCP_NODELAY on accepted connections
 
@@ -500,14 +453,11 @@ buffer. Three memory copies total for what should be one.
 
 **Fix:** Add a `green_recv_into` that takes a buffer object and writes directly into it.
 
-### Q13. No SO_REUSEPORT
+### Q13. No SO_REUSEPORT ✅ FIXED
 
-**File:** `server.py:72`
-
-Only `SO_REUSEADDR` is set. When multi-worker support is added, `SO_REUSEPORT` will be needed for
-kernel-level load balancing across workers.
-
-**Granian** sets it on Linux/FreeBSD.
+**Status**: FIXED. `server.py` sets `SO_REUSEPORT` when `reuseport=True`, which is enabled
+by default in multi-worker mode (`_worker_main`). Kernel-level load balancing across workers
+is now supported.
 
 ---
 
@@ -541,31 +491,24 @@ one-at-a-time. `ring.zig` already has `prepAcceptMultishot` but it's unused.
 
 **Fix:** Use multishot accept to handle bursts without per-connection SQE submission.
 
-### Q16. Python header dict drops duplicate headers
+### Q16. Python header dict drops duplicate headers ⚠️ PARTIALLY FIXED
 
-**File:** `request.py:55`
+**Status**: Dict access (`request.headers`) still uses a dict (last value wins for duplicates),
+but `request.raw_headers` now provides the full `list[tuple[bytes, bytes]]` preserving all
+duplicates. Applications that need duplicate header access can use `raw_headers`.
 
-```python
-headers[name.decode("latin-1").lower()] = value.decode("latin-1")
-```
+**Remaining**: Consider replacing the dict with a multidict for `request.headers` for full compliance.
 
-HTTP allows multiple headers with the same name (e.g., `Set-Cookie`, `Via`, `X-Forwarded-For`).
-Using a dict silently overwrites earlier values. This is a correctness issue.
+### Q17. pyHttpFormatResponse has a 64KB response limit ⚠️ MITIGATED
 
-**Fix:** Use a list of tuples or a multidict for headers.
+**File:** `hub.zig` — `pyHttpFormatResponse` (simple status+body API)
 
-### Q17. pyHttpFormatResponse has a 64KB response limit
+The simple `http_format_response(status, body)` API still uses a 64KB stack buffer. However,
+the main response path (`Response._finalize()`) no longer uses it — it calls
+`http_send_response` which uses arena-allocated header buffers + zero-copy writev for the body,
+with no fixed size limit. The 64KB limit only affects direct callers of `http_format_response`.
 
-**File:** `hub.zig:1903`
-
-```zig
-var buf: [65536]u8 = undefined;
-```
-
-Not currently used by the Python response path (which builds its own bytes), but if anyone calls
-`http_format_response()` directly, responses > 64KB will fail with a RuntimeError.
-
-**Fix:** Dynamic allocation, or document the limit clearly.
+**Fix:** Remove or deprecate `pyHttpFormatResponse` now that `pyHttpSendResponse` handles all responses.
 
 ### Q18. Hub is a global singleton — one per process
 
@@ -621,20 +564,10 @@ threads (from `_dns.py`) and any other Python threads.
 
 **Granian** uses tokio's async runtime which never holds the GIL during I/O processing.
 
-### Q22. Hardcoded listen backlog of 128
+### Q22. Hardcoded listen backlog of 128 ✅ FIXED
 
-**File:** `server.py:74`
-
-```python
-sock.listen(128)
-```
-
-128 is the minimum reasonable value. Under burst traffic with connection queuing, this will cause
-SYN drops at the kernel level.
-
-**Granian** defaults to 1024 and makes it configurable.
-
-**Fix:** Default to 1024, make configurable.
+**Status**: FIXED. `server.py` now accepts a `backlog` parameter defaulting to 1024,
+matching Granian's default.
 
 ---
 
@@ -688,25 +621,25 @@ The existing implementation has several well-designed patterns worth preserving:
 
 | # | Issue | Severity | Effort | Impact | Status |
 |---|-------|----------|--------|--------|--------|
-| Q1 | O(n²) request buffer accumulation | **P0** | Low | Memory blowup on large requests | Open |
+| Q1 | O(n²) request buffer accumulation | **P0** | Low | Memory blowup on large requests | ✅ FIXED |
 | Q2 | Pool exhaustion → fd leak | **P0** | Low | Connection leak under load | ✅ FIXED |
 | Q3 | No request size limit | **P0** | Low | OOM under attack/misconfiguration | ✅ FIXED |
 | Q4 | Double close on keep-alive=false | **P0** | Trivial | Potential fd reuse race | Open |
 | Q5 | Inconsistent state on switch failure | **P0** | Medium | Potential double-resume crash | Open |
 | Q6 | MAX_FDS=4096 fixed array | **P1** | Medium | Untracked fds with many open files | Open |
-| Q7 | Alloc/free per recv | **P1** | Medium | Allocation pressure under load | Open |
-| Q8 | Python-side response building | **P1** | Medium | Unnecessary allocations per response | Open |
-| Q9 | Headers parsed twice | **P1** | Medium | CPU waste, correctness gap | ⏳ PLANNED |
+| Q7 | Alloc/free per recv | **P1** | Medium | Allocation pressure under load | ✅ PARTIALLY FIXED |
+| Q8 | Python-side response building | **P1** | Medium | Unnecessary allocations per response | ✅ FIXED |
+| Q9 | Headers parsed twice | **P1** | Medium | CPU waste, correctness gap | ✅ FIXED |
 | Q10 | No TCP_NODELAY | **P1** | Trivial | Up to 40ms latency on small responses | Open |
 | Q11 | Ring depth 256 | **P1** | Trivial | SQE failures under high concurrency | Open |
 | Q12 | recv_into double copy | **P1** | Medium | Extra copy on every recv_into call | Open |
-| Q13 | No SO_REUSEPORT | **P2** | Trivial | Needed for future multi-worker | Open |
+| Q13 | No SO_REUSEPORT | **P2** | Trivial | Needed for future multi-worker | ✅ FIXED |
 | Q14 | Pool slot leak on alloc failure | **P2** | Trivial | Use appendAssumeCapacity | Open |
 | Q15 | No multishot accept | **P2** | Medium | Accept throughput under burst | Open |
-| Q16 | Duplicate headers dropped | **P2** | Low | HTTP compliance | ⏳ PLANNED |
-| Q17 | 64KB response buffer limit | **P2** | Low | Affects Zig-side response path | Open |
+| Q16 | Duplicate headers dropped | **P2** | Low | HTTP compliance | ⚠️ PARTIALLY FIXED |
+| Q17 | 64KB response buffer limit | **P2** | Low | Affects Zig-side response path | ⚠️ MITIGATED |
 | Q18 | Global singleton hub | **P2** | High | Testing, multi-worker | Open |
 | Q19 | No Connection header in response | **P2** | Trivial | Proxy cooperation | Open |
 | Q20 | Stack-allocated PollGroup fragility | **P2** | Trivial | Comment for safety | Open |
 | Q21 | GIL held during CQE processing | **P2** | High | Blocks DNS/other threads | Open |
-| Q22 | Hardcoded backlog 128 | **P2** | Trivial | Burst handling | Open |
+| Q22 | Hardcoded backlog 128 | **P2** | Trivial | Burst handling | ✅ FIXED |
