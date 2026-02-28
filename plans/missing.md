@@ -97,21 +97,25 @@ The `finally: green_close(fd)` block is good, but the connection pool slot may n
 - SSE (Server-Sent Events) support
 - File response streaming (sendfile equivalent)
 
-### 7. Backpressure / Connection Limiting
+### 7. Backpressure / Connection Limiting ✅ PARTIALLY DONE
 
 **Granian**: Semaphore-based connection limiting per worker (`backpressure = backlog / workers`). Permits are acquired before `accept()`, so the accept loop blocks when at capacity. This prevents unbounded memory growth under load. Also has TCP listen backlog (default 1024).
 
-**theframework**: The accept loop in `_run_acceptor` accepts connections as fast as the kernel delivers them, immediately spawning a greenlet for each. The connection pool is 4096 slots, but there's no backpressure mechanism — when the pool is exhausted, `pool.acquire()` returns null and the accepted fd leaks (comment in code: "If pool exhausted, the fd still works but won't be tracked"). No limit on how many greenlets can be simultaneously active.
+**theframework**: The arena allocator (Phase 5) implements configurable max connections with proper rejection:
+- `sendRejectAndClose(fd, 503)` closes exhausted connections with HTTP 503 instead of leaking the fd
+- `max_connections` is now configurable via `Framework.run()` parameter
+- Arena enforces memory hard limits (max_request_size, max_header_size, max_body_size)
 
-**Note**: nginx's `max_conns` per upstream is the primary gate here. This is defense-in-depth.
+**Completed**:
+- [x] Configurable max concurrent connections — config passed from Python to Zig
+- [x] Proper handling when connection pool is exhausted — send 503 and close, no fd leak
+- [x] Arena-based hard limits on request sizes — 413 Payload Too Large response
 
-**What's missing**:
-- Connection concurrency limit (semaphore or counter)
-- Backpressure: stop accepting when at capacity
-- Configurable max concurrent connections
-- Proper handling when connection pool is exhausted (reject/close rather than leak)
+**Still missing**:
+- [ ] Active backpressure: stop accepting when approaching capacity (currently accepts and rejects)
+- [ ] Per-worker permit tracking (requires multi-threaded coordination)
 
-### 8. Request Header Access in Zig Parser
+### 8. Request Header Access in Zig Parser ⏳ PLANNED
 
 **Granian**: Full header access — all headers are parsed and available to the protocol layer. Headers are used for connection management, content negotiation, WebSocket upgrades, etc.
 
@@ -120,7 +124,9 @@ The `finally: green_close(fd)` block is good, but the connection pool slot may n
 2. The Python re-parsing is fragile (splits on `b"\r\n\r\n"` then `b": "`)
 3. Duplicate headers are silently dropped (dict overwrites)
 
-**What's missing**:
+**Status**: Documented in `plans/headers.md`. Implementation planned as separate phase after arena allocator stabilization.
+
+**What's needed**:
 - Pass parsed headers from Zig to Python directly (avoid double parsing)
 - Support for duplicate headers (e.g., `Set-Cookie` can appear multiple times)
 - Header value validation
@@ -278,37 +284,40 @@ copies.
 
 **Fix:** Use `bytearray` or `list[bytes]` with a single `b"".join()` at parse time.
 
-### Q2. Pool exhaustion silently loses connections (fd leak)
+### Q2. Pool exhaustion silently loses connections (fd leak) ✅ FIXED
 
 **File:** `hub.zig:378-385`
 
+**Status**: FIXED in Phase 4 (arena allocator integration).
+
+When the pool is exhausted, `greenAccept()` now calls `sendRejectAndClose(fd, 503)` to send an HTTP 503 response and properly close the connection, instead of leaking the fd.
+
 ```zig
-if (self.pool.acquire()) |conn| {
-    conn.fd = new_fd;
-    conn.state = .idle;
-    self.fd_to_conn[new_fd_usize] = conn.pool_index;
-}
-// If pool exhausted, the fd still works but won't be tracked
+const conn = self.pool.acquire() orelse {
+    self.sendRejectAndClose(fd, 503);
+    return null;
+};
 ```
 
-When all 4096 pool slots are used, accepted fds are **not tracked**. `greenClose` won't find
-them, `greenRecv`/`greenSend` won't find them. The fd leaks until process exit.
+The fd is properly managed and the client receives a valid HTTP response. No leaks.
 
-**Granian** uses a semaphore to stop accepting before the pool can exhaust.
-
-**Fix:** When pool is exhausted, close the accepted fd immediately and log a warning. Better:
-implement backpressure (stop accepting when pool is near capacity).
-
-### Q3. No request size limit
+### Q3. No request size limit ✅ FIXED
 
 **File:** `server.py:19-26`
 
-The `buf += data` loop accumulates indefinitely. Even behind nginx (`client_max_body_size`), a
-misconfigured proxy or a pipelined sequence of large headers could exhaust memory. There's no cap
-on the buffer size.
+**Status**: FIXED in Phase 1-5 (arena allocator implementation).
 
-**Fix:** Add a configurable max request size (e.g., 1MB default). Return 413 and close if
-exceeded.
+The arena allocator enforces hard limits on request sizes:
+- `max_header_size` — default 32 KB, returns 431 if exceeded
+- `max_body_size` — default 1 MB, returns 413 if exceeded
+- `max_request_size` — total request limit, enforced by arena's hard limit check
+
+Configuration is passed from Python to Zig:
+```python
+Framework.run(max_header_size=32768, max_body_size=1048576)
+```
+
+Limits are enforced both in the arena allocator (Zig) and in the request handler (Python).
 
 ### Q4. Double close on keep-alive=false path
 
@@ -677,27 +686,27 @@ The existing implementation has several well-designed patterns worth preserving:
 
 ## Quality Issues Priority Matrix
 
-| # | Issue | Severity | Effort | Impact |
-|---|-------|----------|--------|--------|
-| Q1 | O(n²) request buffer accumulation | **P0** | Low | Memory blowup on large requests |
-| Q2 | Pool exhaustion → fd leak | **P0** | Low | Connection leak under load |
-| Q3 | No request size limit | **P0** | Low | OOM under attack/misconfiguration |
-| Q4 | Double close on keep-alive=false | **P0** | Trivial | Potential fd reuse race |
-| Q5 | Inconsistent state on switch failure | **P0** | Medium | Potential double-resume crash |
-| Q6 | MAX_FDS=4096 fixed array | **P1** | Medium | Untracked fds with many open files |
-| Q7 | Alloc/free per recv | **P1** | Medium | Allocation pressure under load |
-| Q8 | Python-side response building | **P1** | Medium | Unnecessary allocations per response |
-| Q9 | Headers parsed twice | **P1** | Medium | CPU waste, correctness gap |
-| Q10 | No TCP_NODELAY | **P1** | Trivial | Up to 40ms latency on small responses |
-| Q11 | Ring depth 256 | **P1** | Trivial | SQE failures under high concurrency |
-| Q12 | recv_into double copy | **P1** | Medium | Extra copy on every recv_into call |
-| Q13 | No SO_REUSEPORT | **P2** | Trivial | Needed for future multi-worker |
-| Q14 | Pool slot leak on alloc failure | **P2** | Trivial | Use appendAssumeCapacity |
-| Q15 | No multishot accept | **P2** | Medium | Accept throughput under burst |
-| Q16 | Duplicate headers dropped | **P2** | Low | HTTP compliance |
-| Q17 | 64KB response buffer limit | **P2** | Low | Affects Zig-side response path |
-| Q18 | Global singleton hub | **P2** | High | Testing, multi-worker |
-| Q19 | No Connection header in response | **P2** | Trivial | Proxy cooperation |
-| Q20 | Stack-allocated PollGroup fragility | **P2** | Trivial | Comment for safety |
-| Q21 | GIL held during CQE processing | **P2** | High | Blocks DNS/other threads |
-| Q22 | Hardcoded backlog 128 | **P2** | Trivial | Burst handling |
+| # | Issue | Severity | Effort | Impact | Status |
+|---|-------|----------|--------|--------|--------|
+| Q1 | O(n²) request buffer accumulation | **P0** | Low | Memory blowup on large requests | Open |
+| Q2 | Pool exhaustion → fd leak | **P0** | Low | Connection leak under load | ✅ FIXED |
+| Q3 | No request size limit | **P0** | Low | OOM under attack/misconfiguration | ✅ FIXED |
+| Q4 | Double close on keep-alive=false | **P0** | Trivial | Potential fd reuse race | Open |
+| Q5 | Inconsistent state on switch failure | **P0** | Medium | Potential double-resume crash | Open |
+| Q6 | MAX_FDS=4096 fixed array | **P1** | Medium | Untracked fds with many open files | Open |
+| Q7 | Alloc/free per recv | **P1** | Medium | Allocation pressure under load | Open |
+| Q8 | Python-side response building | **P1** | Medium | Unnecessary allocations per response | Open |
+| Q9 | Headers parsed twice | **P1** | Medium | CPU waste, correctness gap | ⏳ PLANNED |
+| Q10 | No TCP_NODELAY | **P1** | Trivial | Up to 40ms latency on small responses | Open |
+| Q11 | Ring depth 256 | **P1** | Trivial | SQE failures under high concurrency | Open |
+| Q12 | recv_into double copy | **P1** | Medium | Extra copy on every recv_into call | Open |
+| Q13 | No SO_REUSEPORT | **P2** | Trivial | Needed for future multi-worker | Open |
+| Q14 | Pool slot leak on alloc failure | **P2** | Trivial | Use appendAssumeCapacity | Open |
+| Q15 | No multishot accept | **P2** | Medium | Accept throughput under burst | Open |
+| Q16 | Duplicate headers dropped | **P2** | Low | HTTP compliance | ⏳ PLANNED |
+| Q17 | 64KB response buffer limit | **P2** | Low | Affects Zig-side response path | Open |
+| Q18 | Global singleton hub | **P2** | High | Testing, multi-worker | Open |
+| Q19 | No Connection header in response | **P2** | Trivial | Proxy cooperation | Open |
+| Q20 | Stack-allocated PollGroup fragility | **P2** | Trivial | Comment for safety | Open |
+| Q21 | GIL held during CQE processing | **P2** | High | Blocks DNS/other threads | Open |
+| Q22 | Hardcoded backlog 128 | **P2** | Trivial | Burst handling | Open |
