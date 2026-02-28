@@ -652,13 +652,16 @@ pub const Hub = struct {
             return null;
         };
 
-        // Build iovec array: [headers] or [headers, body]
-        // Skip body iovec if empty (e.g. 204 No Content)
-        var iovecs: [2]posix.iovec_const = undefined;
-        iovecs[0] = .{ .base = hdr_buf.ptr, .len = hdr_len };
+        // Build iovec array in the Connection struct (heap-resident).
+        // IMPORTANT: iovecs MUST NOT be on the greenlet stack. When a greenlet
+        // yields, the greenlet library copies the stack to a heap buffer and the
+        // original stack address is reused by other greenlets. io_uring SQEs
+        // store a pointer to the iovec array, so it must remain at a stable
+        // address until the kernel processes the SQE.
+        conn.send_iovecs[0] = .{ .base = hdr_buf.ptr, .len = hdr_len };
         var iov_count: usize = 1;
         if (body_slice.len > 0) {
-            iovecs[1] = .{ .base = body_slice.ptr, .len = body_slice.len };
+            conn.send_iovecs[1] = .{ .base = body_slice.ptr, .len = body_slice.len };
             iov_count = 2;
         }
 
@@ -675,12 +678,12 @@ pub const Hub = struct {
         var first_switch_done = false;
         while (iov_offset < iov_count) {
             // Skip fully-sent iovecs
-            while (iov_offset < iov_count and iovecs[iov_offset].len == 0) {
+            while (iov_offset < iov_count and conn.send_iovecs[iov_offset].len == 0) {
                 iov_offset += 1;
             }
             if (iov_offset >= iov_count) break;
 
-            const remaining_iovecs = iovecs[iov_offset..iov_count];
+            const remaining_iovecs = conn.send_iovecs[iov_offset..iov_count];
             const user_data = conn_mod.encodeUserData(conn.pool_index, conn.generation);
             _ = self.ring.prepWritev(fd, remaining_iovecs, user_data) catch {
                 py.py_helper_decref(body_obj);
@@ -728,13 +731,13 @@ pub const Hub = struct {
             // Advance iovecs past the bytes written
             var written: usize = @intCast(res);
             while (written > 0 and iov_offset < iov_count) {
-                if (written >= iovecs[iov_offset].len) {
-                    written -= iovecs[iov_offset].len;
-                    iovecs[iov_offset].len = 0;
+                if (written >= conn.send_iovecs[iov_offset].len) {
+                    written -= conn.send_iovecs[iov_offset].len;
+                    conn.send_iovecs[iov_offset].len = 0;
                     iov_offset += 1;
                 } else {
-                    iovecs[iov_offset].base += written;
-                    iovecs[iov_offset].len -= written;
+                    conn.send_iovecs[iov_offset].base += written;
+                    conn.send_iovecs[iov_offset].len -= written;
                     written = 0;
                 }
             }

@@ -32,6 +32,14 @@ pub const Connection = struct {
     pool_index: u16,
     result: i32, // CQE result storage
 
+    // Heap-resident iovec array for writev response sending.
+    // Must NOT be on the greenlet stack: when a greenlet yields, the greenlet
+    // library copies its stack frame to a heap buffer and reuses the original
+    // stack address for other greenlets.  io_uring SQEs store a pointer to
+    // the iovec array, so it must remain at a stable address until the kernel
+    // processes the SQE.
+    send_iovecs: [2]posix.iovec_const,
+
     // Per-connection arena allocator (replaces recv_buf/send_buf)
     arena: RequestArena,
     inline_chunk: Chunk, // 4 KB embedded, used as arena's first_chunk
@@ -98,6 +106,7 @@ pub const ConnectionPool = struct {
                 .pending_ops = 0,
                 .pool_index = idx,
                 .result = 0,
+                .send_iovecs = undefined,
                 .inline_chunk = undefined,
                 .arena = undefined,
                 .inline_buf = undefined,
