@@ -20,67 +20,6 @@ from theframework.server import HandlerFunc
 
 
 # ---------------------------------------------------------------------------
-# Unit-level FFI tests for http_format_response (simple status+body API)
-# ---------------------------------------------------------------------------
-
-
-class TestHttpFormatResponse:
-    """Direct tests of _framework_core.http_format_response (no headers variant)."""
-
-    def test_basic_200_with_body(self) -> None:
-        raw = _framework_core.http_format_response(200, b"hello")
-        assert raw == b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
-
-    def test_404_with_body(self) -> None:
-        raw = _framework_core.http_format_response(404, b"not found")
-        assert raw.startswith(b"HTTP/1.1 404 Not Found\r\n")
-        assert b"Content-Length: 9\r\n" in raw
-        assert raw.endswith(b"\r\n\r\nnot found")
-
-    def test_204_no_content(self) -> None:
-        raw = _framework_core.http_format_response(204, b"")
-        assert raw == b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n"
-
-    def test_status_codes(self) -> None:
-        """Verify all supported status codes produce correct status lines."""
-        expected = {
-            200: b"HTTP/1.1 200 OK\r\n",
-            201: b"HTTP/1.1 201 Created\r\n",
-            204: b"HTTP/1.1 204 No Content\r\n",
-            301: b"HTTP/1.1 301 Moved Permanently\r\n",
-            302: b"HTTP/1.1 302 Found\r\n",
-            304: b"HTTP/1.1 304 Not Modified\r\n",
-            400: b"HTTP/1.1 400 Bad Request\r\n",
-            401: b"HTTP/1.1 401 Unauthorized\r\n",
-            403: b"HTTP/1.1 403 Forbidden\r\n",
-            404: b"HTTP/1.1 404 Not Found\r\n",
-            405: b"HTTP/1.1 405 Method Not Allowed\r\n",
-            413: b"HTTP/1.1 413 Payload Too Large\r\n",
-            431: b"HTTP/1.1 431 Request Header Fields Too Large\r\n",
-            500: b"HTTP/1.1 500 Internal Server Error\r\n",
-            502: b"HTTP/1.1 502 Bad Gateway\r\n",
-            503: b"HTTP/1.1 503 Service Unavailable\r\n",
-            504: b"HTTP/1.1 504 Gateway Timeout\r\n",
-        }
-        for code, expected_line in expected.items():
-            raw = _framework_core.http_format_response(code, b"")
-            assert raw.startswith(expected_line), f"Status {code}: {raw!r}"
-
-    def test_unsupported_status_code(self) -> None:
-        with pytest.raises(ValueError, match="Unsupported HTTP status code"):
-            _framework_core.http_format_response(999, b"")
-
-    def test_auto_content_length(self) -> None:
-        """Content-Length is auto-generated matching body size."""
-        # http_format_response uses a 64 KB stack buffer, so body + headers
-        # must fit within that. Keeping body sizes well below the limit.
-        for size in [0, 1, 42, 1000, 60000]:
-            body = b"A" * size
-            raw = _framework_core.http_format_response(200, body)
-            assert f"Content-Length: {size}\r\n".encode() in raw
-
-
-# ---------------------------------------------------------------------------
 # Integration tests (with real HTTP server)
 # ---------------------------------------------------------------------------
 

@@ -153,61 +153,6 @@ pub fn writeResponseHead(
     return pos;
 }
 
-/// Writes the status line and headers (with terminating blank line) but no body.
-///
-/// Does NOT add a Content-Length header automatically. This is intended for
-/// chunked or streaming responses where the caller manages transfer encoding.
-///
-/// Returns the total number of bytes written.
-pub fn writeHead(buf: []u8, status: StatusCode, headers: []const Header) WriteError!usize {
-    var pos: usize = 0;
-
-    try writeStatusLine(buf, &pos, status);
-
-    for (headers) |hdr| {
-        try writeHeaderLine(buf, &pos, hdr);
-    }
-
-    // Blank line terminating the header section.
-    try append(buf, &pos, "\r\n");
-
-    return pos;
-}
-
-/// Writes a single chunked transfer encoding chunk.
-///
-/// Output format: `{hex_length}\r\n{data}\r\n`
-///
-/// Returns the total number of bytes written.
-pub fn writeChunk(buf: []u8, data: []const u8) WriteError!usize {
-    var pos: usize = 0;
-
-    // Format the chunk size as lowercase hex followed by CRLF.
-    var hex_buf: [32]u8 = undefined;
-    const hex_str = std.fmt.bufPrint(&hex_buf, "{x}\r\n", .{data.len}) catch
-        return error.BufferTooSmall;
-    try append(buf, &pos, hex_str);
-
-    // Chunk data.
-    try append(buf, &pos, data);
-
-    // Trailing CRLF after the chunk data.
-    try append(buf, &pos, "\r\n");
-
-    return pos;
-}
-
-/// Writes the terminating zero-length chunk that signals end of chunked data.
-///
-/// Output: `0\r\n\r\n`
-///
-/// Returns the total number of bytes written (always 5).
-pub fn writeEnd(buf: []u8) WriteError!usize {
-    var pos: usize = 0;
-    try append(buf, &pos, "0\r\n\r\n");
-    return pos;
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -243,26 +188,6 @@ test "writeResponse buffer too small" {
     try std.testing.expectError(error.BufferTooSmall, result);
 }
 
-test "writeHead for chunked streaming" {
-    var buf: [4096]u8 = undefined;
-    const hdrs = [_]Header{
-        .{ .name = "Transfer-Encoding", .value = "chunked" },
-    };
-    const n = try writeHead(&buf, .ok, &hdrs);
-    const expected = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
-    try std.testing.expectEqualStrings(expected, buf[0..n]);
-}
-
-test "writeChunk and writeEnd" {
-    var buf: [4096]u8 = undefined;
-    var pos: usize = 0;
-    pos += try writeChunk(buf[pos..], "hello");
-    pos += try writeChunk(buf[pos..], " world");
-    pos += try writeEnd(buf[pos..]);
-    const expected = "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
-    try std.testing.expectEqualStrings(expected, buf[0..pos]);
-}
-
 test "writeResponse 500 Internal Server Error" {
     var buf: [4096]u8 = undefined;
     const n = try writeResponse(&buf, .internal_server_error, &.{}, "error");
@@ -277,24 +202,6 @@ test "StatusCode phrase and code" {
     try std.testing.expectEqual(@as(u16, 404), StatusCode.not_found.code());
     try std.testing.expectEqualStrings("Service Unavailable", StatusCode.service_unavailable.phrase());
     try std.testing.expectEqual(@as(u16, 503), StatusCode.service_unavailable.code());
-}
-
-test "writeHead buffer too small" {
-    var buf: [5]u8 = undefined;
-    const result = writeHead(&buf, .ok, &.{});
-    try std.testing.expectError(error.BufferTooSmall, result);
-}
-
-test "writeChunk buffer too small" {
-    var buf: [3]u8 = undefined;
-    const result = writeChunk(&buf, "hello world");
-    try std.testing.expectError(error.BufferTooSmall, result);
-}
-
-test "writeEnd buffer too small" {
-    var buf: [2]u8 = undefined;
-    const result = writeEnd(&buf);
-    try std.testing.expectError(error.BufferTooSmall, result);
 }
 
 test "writeResponse 201 Created" {

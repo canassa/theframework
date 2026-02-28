@@ -33,31 +33,26 @@ def _run_http_server(listen_fd: int) -> None:
     """Acceptor function: accepts connections and spawns HTTP handlers."""
 
     def handle_connection(fd: int) -> None:
-        buf = b""
         try:
             while True:
-                data = _framework_core.green_recv(fd, 8192)
-                if not data:
-                    break
-                buf += data
+                result = _framework_core.http_read_request(fd, 8192, 1048576)
+                if result is None:
+                    break  # EOF
 
-                # Try to parse a complete HTTP request
-                while True:
-                    result = _framework_core.http_parse_request(buf)
-                    if result is None:
-                        break  # Need more data
+                _method, _path, _body, keep_alive, _headers = result
 
-                    method, path, body, consumed, keep_alive = result
-                    buf = buf[consumed:]
+                # Generate HTTP response
+                body = b"hello world"
+                resp = (
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+                    b"\r\n" + body
+                )
+                _framework_core.green_send(fd, resp)
 
-                    # Generate HTTP response
-                    response_body = b"hello world"
-                    response = _framework_core.http_format_response(200, response_body)
-                    _framework_core.green_send(fd, response)
-
-                    if not keep_alive:
-                        _framework_core.green_close(fd)
-                        return
+                if not keep_alive:
+                    _framework_core.green_close(fd)
+                    return
         except OSError:
             pass
         finally:

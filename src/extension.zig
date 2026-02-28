@@ -188,7 +188,7 @@ fn runHub(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
 // sentinels and flag constants come from extern C helpers)
 // ---------------------------------------------------------------------------
 
-var methods: [25]PyMethodDef = undefined;
+var methods: [23]PyMethodDef = undefined;
 var module_def: PyModuleDef = undefined;
 
 // ---------------------------------------------------------------------------
@@ -272,78 +272,66 @@ pub export fn PyInit__framework_core() callconv(.c) ?*PyObject {
         .ml_doc = "Close fd via io_uring, cleaning up connection pool.",
     };
     methods[12] = .{
-        .ml_name = "http_parse_request",
-        .ml_meth = @ptrCast(&hub.pyHttpParseRequest),
-        .ml_flags = py.py_helper_meth_varargs(),
-        .ml_doc = "Parse HTTP request bytes. Returns (method, path, body, consumed, keep_alive) or None.",
-    };
-    methods[13] = .{
-        .ml_name = "http_format_response",
-        .ml_meth = @ptrCast(&hub.pyHttpFormatResponse),
-        .ml_flags = py.py_helper_meth_varargs(),
-        .ml_doc = "Format an HTTP response. Returns complete response bytes.",
-    };
-    methods[14] = .{
         .ml_name = "green_sleep",
         .ml_meth = @ptrCast(&hub.pyGreenSleep),
         .ml_flags = py.py_helper_meth_varargs(),
         .ml_doc = "Sleep cooperatively for the given number of seconds.",
     };
-    methods[15] = .{
+    methods[13] = .{
         .ml_name = "green_connect",
         .ml_meth = @ptrCast(&hub.pyGreenConnect),
         .ml_flags = py.py_helper_meth_varargs(),
         .ml_doc = "Create socket, connect to host:port cooperatively, return fd.",
     };
-    methods[16] = .{
+    methods[14] = .{
         .ml_name = "green_register_fd",
         .ml_meth = @ptrCast(&hub.pyGreenRegisterFd),
         .ml_flags = py.py_helper_meth_varargs(),
         .ml_doc = "Register an external fd in the connection pool.",
     };
-    methods[17] = .{
+    methods[15] = .{
         .ml_name = "green_unregister_fd",
         .ml_meth = @ptrCast(&hub.pyGreenUnregisterFd),
         .ml_flags = py.py_helper_meth_varargs(),
         .ml_doc = "Remove fd from connection pool without closing it.",
     };
-    methods[18] = .{
+    methods[16] = .{
         .ml_name = "green_connect_fd",
         .ml_meth = @ptrCast(&hub.pyGreenConnectFd),
         .ml_flags = py.py_helper_meth_varargs(),
         .ml_doc = "Connect an already-registered fd cooperatively.",
     };
-    methods[19] = .{
+    methods[17] = .{
         .ml_name = "green_poll_fd",
         .ml_meth = @ptrCast(&hub.pyGreenPollFd),
         .ml_flags = py.py_helper_meth_varargs(),
         .ml_doc = "Wait for fd readiness via POLL_ADD, return revents.",
     };
-    methods[20] = .{
+    methods[18] = .{
         .ml_name = "green_poll_multi",
         .ml_meth = @ptrCast(&hub.pyGreenPollMulti),
         .ml_flags = py.py_helper_meth_varargs(),
         .ml_doc = "Wait for any of N fds to become ready, with timeout. Returns list of (fd, revents).",
     };
-    methods[21] = .{
+    methods[19] = .{
         .ml_name = "green_poll_fd_timeout",
         .ml_meth = @ptrCast(&hub.pyGreenPollFdTimeout),
         .ml_flags = py.py_helper_meth_varargs(),
         .ml_doc = "Wait for fd readiness with timeout via POLL_ADD + LINK_TIMEOUT. Returns revents or 0 on timeout.",
     };
-    methods[22] = .{
+    methods[20] = .{
         .ml_name = "http_read_request",
         .ml_meth = @ptrCast(&hub.pyHttpReadRequest),
         .ml_flags = py.py_helper_meth_varargs(),
         .ml_doc = "Read and parse one HTTP request from fd. Returns (method, path, body, keep_alive, headers) or None on EOF.",
     };
-    methods[23] = .{
+    methods[21] = .{
         .ml_name = "http_send_response",
         .ml_meth = @ptrCast(&hub.pyHttpSendResponse),
         .ml_flags = py.py_helper_meth_varargs(),
         .ml_doc = "Format headers and send response via writev. Zero-copy for body.",
     };
-    methods[24] = py.py_helper_method_sentinel();
+    methods[22] = py.py_helper_method_sentinel();
 
     module_def = .{
         .m_base = py.py_helper_module_def_head_init(),

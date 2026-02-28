@@ -124,21 +124,18 @@ def _echo_handler(fd: int) -> None:
 
 def _http_echo_handler(fd: int) -> None:
     """HTTP handler: reads request, sends response with body = method + path."""
-    buf = b""
-    while True:
-        data = _framework_core.green_recv(fd, 8192)
-        if not data:
-            break
-        buf += data
-        result = _framework_core.http_parse_request(buf)
-        if result is None:
-            continue
-        method, path, _body, consumed, _keep_alive = result
-        buf = buf[consumed:]
-        body = f"{method} {path}".encode()
-        resp = _framework_core.http_format_response(200, body)
-        _framework_core.green_send(fd, resp)
+    result = _framework_core.http_read_request(fd, 8192, 1048576)
+    if result is None:
         return
+    method, path, _body, _keep_alive, _headers = result
+    body = f"{method} {path}".encode()
+    resp = (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+        b"\r\n" + body
+    )
+    _framework_core.green_send(fd, resp)
+    return
 
 
 # ===================================================================
@@ -261,23 +258,20 @@ class TestCooperativeTimeSleep:
 
         def _sleep_handler(fd: int) -> None:
             """Handler that sleeps then responds."""
-            buf = b""
-            while True:
-                data = _framework_core.green_recv(fd, 8192)
-                if not data:
-                    break
-                buf += data
-                result = _framework_core.http_parse_request(buf)
-                if result is None:
-                    continue
-                _method, path, _body, consumed, _keep_alive = result
-                buf = buf[consumed:]
-                if path == "/slow":
-                    _framework_core.green_sleep(0.1)
-                body = path.encode()
-                resp = _framework_core.http_format_response(200, body)
-                _framework_core.green_send(fd, resp)
+            result = _framework_core.http_read_request(fd, 8192, 1048576)
+            if result is None:
                 return
+            _method, path, _body, _keep_alive, _headers = result
+            if path == "/slow":
+                _framework_core.green_sleep(0.1)
+            body = path.encode()
+            resp = (
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+                b"\r\n" + body
+            )
+            _framework_core.green_send(fd, resp)
+            return
 
         self.thread, self.listen_sock = _start_hub(_sleep_handler, self.ready)
 
