@@ -371,30 +371,33 @@ pub const Hub = struct {
     /// Connection-based switch failure cleanup. Idempotent with the CQE handler:
     /// if conn.greenlet is null, the CQE handler already did everything.
     /// Returns true if cleanup was performed (CQE not yet processed).
-    /// Note: does NOT clear the Python exception state — caller returns null
-    /// to propagate whatever exception caused the switch failure.
+    ///
+    /// Does NOT decref the greenlet — this branch also runs during dealloc
+    /// switches (GreenletExit), where the greenlet is mid-dealloc with
+    /// refcnt=1. Decrefing would trigger a nested green_dealloc and crash.
+    /// The ref is owned by deinit, which decrefs all conn.greenlet entries.
     fn cleanupConnSwitch(self: *Hub, conn: *Connection) bool {
         const g_opaque = conn.greenlet orelse return false;
-        const g: *PyObject = @ptrCast(@alignCast(g_opaque));
+        _ = @as(*PyObject, @ptrCast(@alignCast(g_opaque)));
         conn.greenlet = null;
         conn.state = .idle;
         conn.pending_ops -= 1;
         self.active_waits -= 1;
-        py.py_helper_decref(g);
         return true;
     }
 
     /// Op-slot-based switch failure cleanup. Always releases the slot.
     /// Idempotent with the CQE handler: if slot.greenlet is null, the CQE
     /// handler already decremented active_waits and consumed the greenlet ref.
-    /// Note: does NOT clear the Python exception state — caller returns null
-    /// to propagate whatever exception caused the switch failure.
+    ///
+    /// Does NOT decref the greenlet — this branch also runs during dealloc
+    /// switches (GreenletExit), where the greenlet is mid-dealloc with
+    /// refcnt=1. Decrefing would trigger a nested green_dealloc and crash.
+    /// The ref is owned by deinit, which decrefs all slot.greenlet entries.
     fn cleanupSlotSwitch(self: *Hub, slot: *OpSlot) void {
-        if (slot.greenlet) |g_opaque| {
-            const g: *PyObject = @ptrCast(@alignCast(g_opaque));
+        if (slot.greenlet) |_| {
             slot.greenlet = null;
             self.active_waits -= 1;
-            py.py_helper_decref(g);
         }
         self.op_slots.release(slot);
     }
@@ -435,17 +438,19 @@ pub const Hub = struct {
         };
         const switch_result = py.py_helper_greenlet_switch(hub_g, null, null);
         if (switch_result == null) {
-            // Do NOT decrement active_waits — the accept CQE handler (line 247)
-            // unconditionally decrements it when the CQE arrives.
-            // Leave accept_pending = true — prevents overlapping accepts with
-            // the same ACCEPT_SENTINEL user_data. CQE handler will clear it.
-            // Note: accept_greenlet is intentionally left as-is.  When the
-            // accept CQE eventually arrives, the CQE handler will move the
-            // (now-dead) greenlet to the ready queue and null accept_greenlet.
-            // The hub loop drain handles dead greenlets gracefully: switch
-            // returns () (empty tuple, not NULL), the greenlet and result are
-            // decreffed, and the loop continues.
-            // If the hub exits first, deinit decrefs accept_greenlet directly.
+            // Do NOT decref or touch any state here.
+            //
+            // This branch runs in TWO scenarios:
+            //   1. Normal switch failure (runtime error during greenlet_switch)
+            //   2. Dealloc switch (GreenletExit thrown during green_dealloc)
+            //
+            // In scenario 2, the greenlet is being deallocated with refcnt=1.
+            // Decrefing here triggers a nested green_dealloc, corrupting GC
+            // tracking state and causing a segfault.
+            //
+            // In both scenarios, the greenlet ref and active_waits are owned
+            // by the CQE handler (which will arrive and clean up) or by
+            // Hub.deinit (which decrefs accept_greenlet if non-null).
             return null;
         }
         py.py_helper_decref(switch_result);
@@ -641,13 +646,13 @@ pub const Hub = struct {
             };
             const switch_result = py.py_helper_greenlet_switch(hub_g, null, null);
             if (switch_result == null) {
-                if (conn.greenlet) |g_opaque| {
-                    const g: *PyObject = @ptrCast(@alignCast(g_opaque));
+                // Do NOT decref the greenlet — this branch also runs during
+                // dealloc switches (GreenletExit). See cleanupConnSwitch.
+                if (conn.greenlet) |_| {
                     conn.greenlet = null;
                     conn.state = .idle;
                     conn.pending_ops -= 1;
                     self.active_waits -= 1;
-                    if (total_sent == 0) py.py_helper_decref(g);
                 }
                 py.py_helper_decref(py_bytes);
                 return null;
@@ -774,21 +779,17 @@ pub const Hub = struct {
             };
             const switch_result = py.py_helper_greenlet_switch(hub_g, null, null);
             if (switch_result == null) {
-                if (conn.greenlet) |g_opaque| {
-                    const g: *PyObject = @ptrCast(@alignCast(g_opaque));
+                // Do NOT decref the greenlet — this branch also runs during
+                // dealloc switches (GreenletExit). See cleanupConnSwitch.
+                if (conn.greenlet) |_| {
                     conn.greenlet = null;
                     conn.state = .idle;
                     conn.pending_ops -= 1;
                     self.active_waits -= 1;
-                    if (!first_switch_done) py.py_helper_decref(g);
                 }
                 py.py_helper_decref(body_obj);
                 return null;
             }
-            // Must be AFTER the null check: on switch failure during iteration 1,
-            // first_switch_done must still be false so we decref current (we own the ref).
-            // On iteration 2+, the previous iteration set this to true, so the decref
-            // is correctly skipped (the ref was consumed by the CQE handler cycle).
             first_switch_done = true;
             py.py_helper_decref(switch_result);
 
@@ -1468,12 +1469,10 @@ pub const Hub = struct {
         if (switch_result == null) {
             // IMPORTANT: read group_ptr BEFORE cancelAndReleasePollSlots, which
             // releases slots[0] (where the PollGroup storage lives).
+            // Do NOT decref the greenlet — this branch also runs during
+            // dealloc switches (GreenletExit). See cleanupConnSwitch.
             if (!group_ptr.resumed) {
                 self.active_waits -= total_slots;
-                if (group_ptr.greenlet) |g_opaque| {
-                    const g: *PyObject = @ptrCast(@alignCast(g_opaque));
-                    py.py_helper_decref(g);
-                }
             }
             self.cancelAndReleasePollSlots(slots[0..total_slots]);
             return null;
