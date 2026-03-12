@@ -365,6 +365,41 @@ pub const Hub = struct {
     }
 
     // -----------------------------------------------------------------------
+    // Switch failure cleanup helpers
+    // -----------------------------------------------------------------------
+
+    /// Connection-based switch failure cleanup. Idempotent with the CQE handler:
+    /// if conn.greenlet is null, the CQE handler already did everything.
+    /// Returns true if cleanup was performed (CQE not yet processed).
+    /// Note: does NOT clear the Python exception state — caller returns null
+    /// to propagate whatever exception caused the switch failure.
+    fn cleanupConnSwitch(self: *Hub, conn: *Connection) bool {
+        const g_opaque = conn.greenlet orelse return false;
+        const g: *PyObject = @ptrCast(@alignCast(g_opaque));
+        conn.greenlet = null;
+        conn.state = .idle;
+        conn.pending_ops -= 1;
+        self.active_waits -= 1;
+        py.py_helper_decref(g);
+        return true;
+    }
+
+    /// Op-slot-based switch failure cleanup. Always releases the slot.
+    /// Idempotent with the CQE handler: if slot.greenlet is null, the CQE
+    /// handler already decremented active_waits and consumed the greenlet ref.
+    /// Note: does NOT clear the Python exception state — caller returns null
+    /// to propagate whatever exception caused the switch failure.
+    fn cleanupSlotSwitch(self: *Hub, slot: *OpSlot) void {
+        if (slot.greenlet) |g_opaque| {
+            const g: *PyObject = @ptrCast(@alignCast(g_opaque));
+            slot.greenlet = null;
+            self.active_waits -= 1;
+            py.py_helper_decref(g);
+        }
+        self.op_slots.release(slot);
+    }
+
+    // -----------------------------------------------------------------------
     // green_accept: submit accept SQE, yield, return new fd
     // -----------------------------------------------------------------------
 
@@ -399,7 +434,20 @@ pub const Hub = struct {
             return null;
         };
         const switch_result = py.py_helper_greenlet_switch(hub_g, null, null);
-        if (switch_result == null) return null;
+        if (switch_result == null) {
+            // Do NOT decrement active_waits — the accept CQE handler (line 247)
+            // unconditionally decrements it when the CQE arrives.
+            // Leave accept_pending = true — prevents overlapping accepts with
+            // the same ACCEPT_SENTINEL user_data. CQE handler will clear it.
+            // Note: accept_greenlet is intentionally left as-is.  When the
+            // accept CQE eventually arrives, the CQE handler will move the
+            // (now-dead) greenlet to the ready queue and null accept_greenlet.
+            // The hub loop drain handles dead greenlets gracefully: switch
+            // returns () (empty tuple, not NULL), the greenlet and result are
+            // decreffed, and the loop continues.
+            // If the hub exits first, deinit decrefs accept_greenlet directly.
+            return null;
+        }
         py.py_helper_decref(switch_result);
 
         // On resume: read result
@@ -498,6 +546,7 @@ pub const Hub = struct {
         };
         const switch_result = py.py_helper_greenlet_switch(hub_g, null, null);
         if (switch_result == null) {
+            _ = self.cleanupConnSwitch(conn);
             return null;
         }
         py.py_helper_decref(switch_result);
@@ -592,6 +641,14 @@ pub const Hub = struct {
             };
             const switch_result = py.py_helper_greenlet_switch(hub_g, null, null);
             if (switch_result == null) {
+                if (conn.greenlet) |g_opaque| {
+                    const g: *PyObject = @ptrCast(@alignCast(g_opaque));
+                    conn.greenlet = null;
+                    conn.state = .idle;
+                    conn.pending_ops -= 1;
+                    self.active_waits -= 1;
+                    if (total_sent == 0) py.py_helper_decref(g);
+                }
                 py.py_helper_decref(py_bytes);
                 return null;
             }
@@ -716,11 +773,23 @@ pub const Hub = struct {
                 return null;
             };
             const switch_result = py.py_helper_greenlet_switch(hub_g, null, null);
-            first_switch_done = true;
             if (switch_result == null) {
+                if (conn.greenlet) |g_opaque| {
+                    const g: *PyObject = @ptrCast(@alignCast(g_opaque));
+                    conn.greenlet = null;
+                    conn.state = .idle;
+                    conn.pending_ops -= 1;
+                    self.active_waits -= 1;
+                    if (!first_switch_done) py.py_helper_decref(g);
+                }
                 py.py_helper_decref(body_obj);
                 return null;
             }
+            // Must be AFTER the null check: on switch failure during iteration 1,
+            // first_switch_done must still be false so we decref current (we own the ref).
+            // On iteration 2+, the previous iteration set this to true, so the decref
+            // is correctly skipped (the ref was consumed by the CQE handler cycle).
+            first_switch_done = true;
             py.py_helper_decref(switch_result);
 
             const res = conn.result;
@@ -828,7 +897,10 @@ pub const Hub = struct {
             return null;
         };
         const switch_result = py.py_helper_greenlet_switch(hub_g, null, null);
-        if (switch_result == null) return null;
+        if (switch_result == null) {
+            _ = self.cleanupConnSwitch(conn);
+            return null;
+        }
         py.py_helper_decref(switch_result);
 
         const res = conn.result;
@@ -860,14 +932,15 @@ pub const Hub = struct {
             return null;
         };
 
-        // Convert seconds to kernel_timespec
+        // Convert seconds to kernel_timespec — stored in the slot so it
+        // survives greenlet stack swaps (io_uring reads the pointer at submit time).
         const whole_secs: i64 = @intFromFloat(seconds);
         const frac_nanos: i64 = @intFromFloat((seconds - @as(f64, @floatFromInt(whole_secs))) * 1_000_000_000.0);
-        var ts = linux.kernel_timespec{ .sec = whole_secs, .nsec = frac_nanos };
+        slot.storage = .{ .timespec = .{ .sec = whole_secs, .nsec = frac_nanos } };
 
         // Submit timeout SQE
         const user_data = op_slot.encodeUserData(slot.slot_index, slot.generation);
-        _ = self.ring.prepTimeout(&ts, user_data) catch {
+        _ = self.ring.prepTimeout(&slot.storage.timespec, user_data) catch {
             py.py_helper_decref(current);
             self.op_slots.release(slot);
             py.py_helper_err_set_string(
@@ -894,7 +967,7 @@ pub const Hub = struct {
         };
         const switch_result = py.py_helper_greenlet_switch(hub_g, null, null);
         if (switch_result == null) {
-            self.op_slots.release(slot);
+            self.cleanupSlotSwitch(slot);
             return null;
         }
         py.py_helper_decref(switch_result);
@@ -938,8 +1011,6 @@ pub const Hub = struct {
             );
             return null;
         };
-
-        var sockaddr = std.net.Address.initIp4(addr_bytes, port);
 
         // Register fd in connection pool first
         const fd_usize: usize = @intCast(fd);
@@ -985,9 +1056,12 @@ pub const Hub = struct {
             return null;
         };
 
+        // Store sockaddr in the slot — survives greenlet stack swaps.
+        slot.storage = .{ .sockaddr = std.net.Address.initIp4(addr_bytes, port).any };
+
         // Submit connect SQE using op_slot user_data
         const user_data = op_slot.encodeUserData(slot.slot_index, slot.generation);
-        _ = self.ring.prepConnect(fd, &sockaddr.any, sockaddr.getOsSockLen(), user_data) catch {
+        _ = self.ring.prepConnect(fd, &slot.storage.sockaddr, @sizeOf(posix.sockaddr), user_data) catch {
             py.py_helper_decref(current);
             self.op_slots.release(slot);
             self.fd_to_conn[fd_usize] = null;
@@ -1020,7 +1094,7 @@ pub const Hub = struct {
         };
         const switch_result = py.py_helper_greenlet_switch(hub_g, null, null);
         if (switch_result == null) {
-            self.op_slots.release(slot);
+            self.cleanupSlotSwitch(slot);
             self.fd_to_conn[fd_usize] = null;
             self.pool.release(conn);
             posix.close(fd);
@@ -1066,8 +1140,6 @@ pub const Hub = struct {
             return null;
         };
 
-        var sockaddr = std.net.Address.initIp4(addr_bytes, port);
-
         // Acquire op slot for the connect operation
         const slot = self.op_slots.acquire() orelse {
             py.py_helper_err_set_string(
@@ -1083,9 +1155,12 @@ pub const Hub = struct {
             return null;
         };
 
+        // Store sockaddr in the slot — survives greenlet stack swaps.
+        slot.storage = .{ .sockaddr = std.net.Address.initIp4(addr_bytes, port).any };
+
         // Submit connect SQE using op_slot user_data
         const user_data = op_slot.encodeUserData(slot.slot_index, slot.generation);
-        _ = self.ring.prepConnect(fd, &sockaddr.any, sockaddr.getOsSockLen(), user_data) catch {
+        _ = self.ring.prepConnect(fd, &slot.storage.sockaddr, @sizeOf(posix.sockaddr), user_data) catch {
             py.py_helper_decref(current);
             self.op_slots.release(slot);
             py.py_helper_err_set_string(
@@ -1112,7 +1187,7 @@ pub const Hub = struct {
         };
         const switch_result = py.py_helper_greenlet_switch(hub_g, null, null);
         if (switch_result == null) {
-            self.op_slots.release(slot);
+            self.cleanupSlotSwitch(slot);
             return null;
         }
         py.py_helper_decref(switch_result);
@@ -1180,7 +1255,7 @@ pub const Hub = struct {
         };
         const switch_result = py.py_helper_greenlet_switch(hub_g, null, null);
         if (switch_result == null) {
-            self.op_slots.release(slot);
+            self.cleanupSlotSwitch(slot);
             return null;
         }
         py.py_helper_decref(switch_result);
@@ -1321,16 +1396,18 @@ pub const Hub = struct {
             return null;
         };
 
-        // Set up PollGroup on the stack (safe: greenlet stack preserved while suspended)
-        var group = op_slot.PollGroup{
+        // Store PollGroup in the first slot's storage — heap-allocated,
+        // survives greenlet stack swaps.  All slots reference it via pointer.
+        slots[0].storage = .{ .poll_group = .{
             .resumed = false,
             .greenlet = current,
             .active_waits_n = @intCast(total_slots),
-        };
+        } };
+        const group_ptr = &slots[0].storage.poll_group;
 
         // Set poll_group on all slots
         for (0..total_slots) |i| {
-            slots[i].poll_group = &group;
+            slots[i].poll_group = group_ptr;
         }
 
         // Submit POLL_ADD SQEs
@@ -1350,14 +1427,14 @@ pub const Hub = struct {
             };
         }
 
-        // Submit TIMEOUT SQE if needed
+        // Submit TIMEOUT SQE if needed — store timespec in the timeout slot.
         if (has_timeout) {
-            var ts = linux.kernel_timespec{
+            slots[n].storage = .{ .timespec = .{
                 .sec = @divTrunc(timeout_ms, 1000),
                 .nsec = @rem(timeout_ms, 1000) * 1_000_000,
-            };
+            } };
             const timeout_ud = op_slot.encodeUserData(slots[n].slot_index, slots[n].generation);
-            _ = self.ring.prepTimeout(&ts, timeout_ud) catch {
+            _ = self.ring.prepTimeout(&slots[n].storage.timespec, timeout_ud) catch {
                 py.py_helper_decref(current);
                 for (0..total_slots) |j| {
                     slots[j].poll_group = null;
@@ -1389,6 +1466,15 @@ pub const Hub = struct {
         };
         const switch_result = py.py_helper_greenlet_switch(hub_g, null, null);
         if (switch_result == null) {
+            // IMPORTANT: read group_ptr BEFORE cancelAndReleasePollSlots, which
+            // releases slots[0] (where the PollGroup storage lives).
+            if (!group_ptr.resumed) {
+                self.active_waits -= total_slots;
+                if (group_ptr.greenlet) |g_opaque| {
+                    const g: *PyObject = @ptrCast(@alignCast(g_opaque));
+                    py.py_helper_decref(g);
+                }
+            }
             self.cancelAndReleasePollSlots(slots[0..total_slots]);
             return null;
         }
@@ -1468,12 +1554,12 @@ pub const Hub = struct {
         };
         sqe.flags |= IOSQE_IO_LINK;
 
-        // Submit LINK_TIMEOUT SQE (kernel auto-cancels the poll if timeout fires)
-        var ts = linux.kernel_timespec{
+        // Store timespec in the slot — survives greenlet stack swaps.
+        slot.storage = .{ .timespec = .{
             .sec = @divTrunc(timeout_ms, 1000),
             .nsec = @rem(timeout_ms, 1000) * 1_000_000,
-        };
-        _ = self.ring.prepLinkTimeout(&ts, IGNORE_SENTINEL) catch {
+        } };
+        _ = self.ring.prepLinkTimeout(&slot.storage.timespec, IGNORE_SENTINEL) catch {
             py.py_helper_decref(current);
             self.op_slots.release(slot);
             py.py_helper_err_set_string(
@@ -1500,7 +1586,7 @@ pub const Hub = struct {
         };
         const switch_result = py.py_helper_greenlet_switch(hub_g, null, null);
         if (switch_result == null) {
-            self.op_slots.release(slot);
+            self.cleanupSlotSwitch(slot);
             return null;
         }
         py.py_helper_decref(switch_result);
@@ -1807,6 +1893,14 @@ pub fn pyHubSchedule(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
     const none = py.py_helper_none();
     py.py_helper_incref(none);
     return none;
+}
+
+/// get_active_waits() → int
+pub fn pyGetActiveWaits(_: ?*PyObject, _: ?*PyObject) callconv(.c) ?*PyObject {
+    const hub_ptr = getHub() orelse {
+        return py.PyLong_FromLong(0);
+    };
+    return py.PyLong_FromLong(@as(c_long, @intCast(hub_ptr.active_waits)));
 }
 
 /// get_hub_greenlet() → greenlet

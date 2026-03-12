@@ -1,4 +1,6 @@
 const std = @import("std");
+const linux = std.os.linux;
+const posix = std.posix;
 
 // ---------------------------------------------------------------------------
 // OpSlot
@@ -6,13 +8,23 @@ const std = @import("std");
 
 /// Coordination struct for green_poll_multi: multiple op slots share
 /// a single PollGroup so that only the first CQE resumes the greenlet.
-/// Lifetime: stack-allocated in greenPollMulti; valid while the
-/// greenlet is suspended.  Slots are released (generation-bumped)
-/// before the function returns, so stale CQEs never dereference this.
 pub const PollGroup = struct {
     resumed: bool,
     greenlet: ?*anyopaque, // the greenlet to resume (incref'd once)
     active_waits_n: u32, // how many we added to hub.active_waits
+};
+
+/// Persistent storage for io_uring SQE parameters.
+///
+/// io_uring SQEs hold *pointers* to caller-owned memory (timespec,
+/// sockaddr, etc.).  The SQEs are not submitted to the kernel until
+/// submitAndWait() in the hub loop — by which time the greenlet that
+/// prepared the SQE has switched out and its C stack has been reused.
+/// Storing these values in the heap-allocated OpSlot keeps them alive.
+pub const SqeStorage = union {
+    timespec: linux.kernel_timespec,
+    sockaddr: posix.sockaddr,
+    poll_group: PollGroup,
 };
 
 pub const OpSlot = struct {
@@ -21,6 +33,7 @@ pub const OpSlot = struct {
     generation: u32,
     slot_index: u16,
     poll_group: ?*PollGroup, // non-null only for green_poll_multi slots
+    storage: SqeStorage, // persistent storage for SQE parameters
 
     pub fn reset(self: *OpSlot) void {
         // Note: caller must decref greenlet before calling reset
@@ -87,6 +100,7 @@ pub const OpSlotTable = struct {
                 .generation = 0,
                 .slot_index = idx,
                 .poll_group = null,
+                .storage = .{ .timespec = .{ .sec = 0, .nsec = 0 } },
             };
         }
 

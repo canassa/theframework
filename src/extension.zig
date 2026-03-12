@@ -189,7 +189,7 @@ fn runHub(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
 // sentinels and flag constants come from extern C helpers)
 // ---------------------------------------------------------------------------
 
-var methods: [23]PyMethodDef = undefined;
+var methods: [24]PyMethodDef = undefined;
 var module_def: PyModuleDef = undefined;
 
 // ---------------------------------------------------------------------------
@@ -332,7 +332,13 @@ pub export fn PyInit__framework_core() callconv(.c) ?*PyObject {
         .ml_flags = py.py_helper_meth_varargs(),
         .ml_doc = "Format headers and send response via writev. Zero-copy for body.",
     };
-    methods[22] = py.py_helper_method_sentinel();
+    methods[22] = .{
+        .ml_name = "get_active_waits",
+        .ml_meth = @ptrCast(&hub.pyGetActiveWaits),
+        .ml_flags = py.py_helper_meth_noargs(),
+        .ml_doc = "Return hub.active_waits (for testing).",
+    };
+    methods[23] = py.py_helper_method_sentinel();
 
     module_def = .{
         .m_base = py.py_helper_module_def_head_init(),

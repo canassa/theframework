@@ -4,3 +4,6 @@
 [submodule "h2o"]
 	path = h2o
 	url = https://github.com/h2o/h2o.git
+[submodule "vendor/gevent"]
+	path = vendor/gevent
+	url = https://github.com/gevent/gevent.git
