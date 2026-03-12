@@ -20,6 +20,8 @@ const arena_mod = @import("arena.zig");
 const RequestArena = arena_mod.RequestArena;
 const BufferRecycler = @import("buffer_recycler.zig").BufferRecycler;
 
+const lazy_request = @import("lazy_request.zig");
+
 const py = @cImport({
     @cInclude("py_helpers.h");
 });
@@ -2207,6 +2209,7 @@ const ParsedRequest = struct {
     body: []const u8, // zero-copy slice into InputBuffer
     raw_bytes_consumed: usize,
     keep_alive: bool,
+    query_offset: usize, // offset of '?' in path, or path.len if none
 };
 
 const ParseResult = union(enum) {
@@ -2252,6 +2255,13 @@ fn tryParse(
     // Validate limits.
     if (header_bytes > max_header_size) return .header_too_large;
 
+    // Reject header keys that exceed the stack buffer size used by the headers
+    // getter for lowercasing.  Without this check, a pathologically long header
+    // key would overflow the getter's stack buffer.
+    for (headers[0..header_count]) |hdr| {
+        if (hdr.key.len > lazy_request.MAX_HEADER_KEY_LEN) return .invalid;
+    }
+
     // Determine body length
     const content_length: usize = blk: {
         const cl = http.findHeader(headers[0..header_count], "content-length") orelse break :blk 0;
@@ -2271,120 +2281,98 @@ fn tryParse(
         break :blk version == .@"1.1";
     };
 
+    const resolved_path = path orelse return .invalid;
+    const query_offset = std.mem.indexOfScalar(u8, resolved_path, '?') orelse resolved_path.len;
+
     return .{ .complete = .{
         .method = method,
-        .path = path orelse return .invalid,
+        .path = resolved_path,
         .version = version,
         .headers = headers[0..header_count], // arena-owned slice
         .body = buf[header_bytes .. header_bytes + content_length],
         .raw_bytes_consumed = header_bytes + content_length,
         .keep_alive = ka,
+        .query_offset = query_offset,
     } };
 }
 
-/// Convert a parsed request to a Python 5-tuple.
+/// Build a LazyRequest Python object from a parsed request.
 ///
-/// IMPORTANT: Must be called BEFORE conn.input.consume() — header slices
-/// are zero-copy pointers into the InputBuffer's unconsumed region.
+/// IMPORTANT: Must be called BEFORE conn.input.consume() — raw pointers
+/// reference the InputBuffer's unconsumed region and arena-allocated headers.
 /// After consume(), those bytes are logically freed and may be overwritten
 /// by a future compact().
 ///
-/// Returns (method, path, body, keep_alive, headers).
-fn buildPyResult(req: ParsedRequest) ?*PyObject {
-    // Method string
-    const method_str = methodToStr(req.method);
-    const py_method = py.PyUnicode_FromStringAndSize(
-        method_str.ptr,
-        @intCast(method_str.len),
+/// Safety: raw_headers_ptr points into arena-allocated memory (conn.arena),
+/// and raw_body_ptr/raw_qs_ptr point into the InputBuffer's consumed region.
+/// Both become invalid on the next pyHttpReadRequest() call: arena.reset()
+/// frees the header array, and resetForNewRequest() → compact() may memmove
+/// data over the consumed region. consume() after buildLazyRequest() only
+/// advances read_pos (bytes stay in place), so pointers remain valid during
+/// the handler. _invalidate() is called in the finally block before the next
+/// pyHttpReadRequest() call.
+fn buildLazyRequest(req: ParsedRequest) ?*PyObject {
+    const request_type: *py.PyTypeObject = @ptrCast(&lazy_request.LazyRequestType);
+    const obj = request_type.tp_alloc.?(request_type, 0) orelse return null;
+    const self: *py.LazyRequestObject = @ptrCast(@alignCast(obj));
+
+    // Initialize everything to null/zero so dealloc is safe on partial failure.
+    self.method = null;
+    self.path = null;
+    self.full_path = null;
+    self.cached_body = null;
+    self.cached_headers = null;
+    self.cached_query_params = null;
+    self.cached_params = null;
+    self.valid = 0;
+    self.raw_body_ptr = null;
+    self.raw_body_len = 0;
+    self.raw_headers_ptr = null;
+    self.raw_headers_count = 0;
+    self.raw_qs_ptr = null;
+    self.raw_qs_len = 0;
+    self.keep_alive = 0;
+
+    var success = false;
+    defer if (!success) lazy_request.lazy_request_dealloc(@ptrCast(obj));
+
+    // Eager: method (interned string, just incref)
+    // @ptrCast needed: lazy_request.zig and hub.zig have separate @cImport namespaces,
+    // producing structurally identical but nominally distinct PyObject types.
+    self.method = @ptrCast(lazy_request.methodToPyStr(req.method) orelse return null);
+
+    // Eager: path (portion before '?')
+    self.path = py.PyUnicode_FromStringAndSize(
+        req.path.ptr,
+        @intCast(req.query_offset),
     ) orelse return null;
 
-    // Path string (zero-copy slice into InputBuffer -> copy to Python)
-    const py_path = py.PyUnicode_FromStringAndSize(
-        req.path.ptr,
-        @intCast(req.path.len),
-    ) orelse {
-        py.py_helper_decref(py_method);
-        return null;
-    };
-
-    // Body bytes (zero-copy slice into InputBuffer -> copy to Python)
-    const py_body = py.py_helper_bytes_from_string_and_size(
-        @ptrCast(req.body.ptr),
-        @intCast(req.body.len),
-    ) orelse {
-        py.py_helper_decref(py_method);
-        py.py_helper_decref(py_path);
-        return null;
-    };
-
-    // Keep-alive bool
-    const py_ka = if (req.keep_alive) py.py_helper_true() else py.py_helper_false();
-    py.py_helper_incref(py_ka);
-
-    // Headers: list[tuple[bytes, bytes]]
-    const py_headers = buildPyHeaders(req.headers) orelse {
-        py.py_helper_decref(py_method);
-        py.py_helper_decref(py_path);
-        py.py_helper_decref(py_body);
-        py.py_helper_decref(py_ka);
-        return null;
-    };
-
-    // Build 5-tuple: (method, path, body, keep_alive, headers)
-    const tuple = py.py_helper_tuple_new(5) orelse {
-        py.py_helper_decref(py_method);
-        py.py_helper_decref(py_path);
-        py.py_helper_decref(py_body);
-        py.py_helper_decref(py_ka);
-        py.py_helper_decref(py_headers);
-        return null;
-    };
-
-    // PyTuple_SetItem steals references
-    _ = py.py_helper_tuple_setitem(tuple, 0, py_method);
-    _ = py.py_helper_tuple_setitem(tuple, 1, py_path);
-    _ = py.py_helper_tuple_setitem(tuple, 2, py_body);
-    _ = py.py_helper_tuple_setitem(tuple, 3, py_ka);
-    _ = py.py_helper_tuple_setitem(tuple, 4, py_headers);
-
-    return tuple;
-}
-
-/// Convert arena-allocated headers to Python list[tuple[bytes, bytes]].
-/// Each header's .key/.value are zero-copy slices into the InputBuffer.
-/// This function copies the bytes into Python objects, after which
-/// the InputBuffer region can be safely consumed.
-fn buildPyHeaders(headers: []const http.Header) ?*PyObject {
-    const list = py.PyList_New(@intCast(headers.len)) orelse return null;
-    for (headers, 0..) |hdr, i| {
-        const key = py.py_helper_bytes_from_string_and_size(
-            @ptrCast(hdr.key.ptr),
-            @intCast(hdr.key.len),
-        ) orelse {
-            py.py_helper_decref(list);
-            return null;
-        };
-
-        const val = py.py_helper_bytes_from_string_and_size(
-            @ptrCast(hdr.value.ptr),
-            @intCast(hdr.value.len),
-        ) orelse {
-            py.py_helper_decref(key);
-            py.py_helper_decref(list);
-            return null;
-        };
-
-        const header_tuple = py.py_helper_tuple_new(2) orelse {
-            py.py_helper_decref(val);
-            py.py_helper_decref(key);
-            py.py_helper_decref(list);
-            return null;
-        };
-        _ = py.py_helper_tuple_setitem(header_tuple, 0, key); // steals ref
-        _ = py.py_helper_tuple_setitem(header_tuple, 1, val); // steals ref
-        _ = py.PyList_SetItem(list, @intCast(i), header_tuple); // steals ref
+    // Eager: full_path
+    if (req.query_offset < req.path.len) {
+        self.full_path = py.PyUnicode_FromStringAndSize(
+            req.path.ptr,
+            @intCast(req.path.len),
+        ) orelse return null;
+        const qs_start = req.query_offset + 1;
+        self.raw_qs_ptr = @ptrCast(req.path[qs_start..].ptr);
+        self.raw_qs_len = @intCast(req.path.len - qs_start);
+    } else {
+        py.py_helper_incref(self.path.?);
+        self.full_path = self.path; // same object, no query
+        self.raw_qs_ptr = null;
+        self.raw_qs_len = 0;
     }
-    return list;
+
+    // Raw pointers (zero-copy)
+    self.raw_body_ptr = @ptrCast(req.body.ptr);
+    self.raw_body_len = @intCast(req.body.len);
+    self.raw_headers_ptr = @ptrCast(@constCast(req.headers.ptr));
+    self.raw_headers_count = @intCast(req.headers.len);
+
+    self.keep_alive = @intFromBool(req.keep_alive);
+    self.valid = 1;
+    success = true;
+    return obj;
 }
 
 /// Return Python None (with incref).
@@ -2496,7 +2484,7 @@ pub fn pyHttpReadRequest(
             .complete => |req| {
                 // Build Python objects BEFORE consume -- header slices
                 // point into InputBuffer's unconsumed region
-                const py_result = buildPyResult(req) orelse return null;
+                const py_result = buildLazyRequest(req) orelse return null;
                 conn.input.consume(req.raw_bytes_consumed);
                 return py_result;
             },
@@ -2552,7 +2540,7 @@ pub fn pyHttpReadRequest(
             .complete => |req| {
                 // Build Python objects BEFORE consume -- header slices
                 // point into InputBuffer's unconsumed region
-                const py_result = buildPyResult(req) orelse return null;
+                const py_result = buildLazyRequest(req) orelse return null;
                 conn.input.consume(req.raw_bytes_consumed);
                 return py_result;
             },

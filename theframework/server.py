@@ -133,29 +133,27 @@ def _handle_connection(
     max_body_size = cfg.get("max_body_size", 1_048_576)
     try:
         while True:
-            result = _framework_core.http_read_request(
+            request = _framework_core.http_read_request(
                 fd,
                 max_header_size,
                 max_body_size,
             )
-            if result is None:
+            if request is None:
                 return  # EOF, finally block closes
 
-            method, path, body, keep_alive, headers = result
-            request = Request._from_parsed(method, path, body, headers)
             response = Response(fd)
-
             try:
                 handler(request, response)
+                response._finalize()
             except Exception:
                 # Send 500 if response not yet sent
                 if not response._finalized:
                     _try_send_error(fd, 500)
                 return
+            finally:
+                request._invalidate()
 
-            response._finalize()
-
-            if not keep_alive:
+            if not request._keep_alive:
                 return  # finally block closes
 
     except ValueError:

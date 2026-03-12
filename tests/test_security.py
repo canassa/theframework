@@ -645,7 +645,7 @@ class TestHeaderManipulation:
             c2.close()
 
     def test_duplicate_host_headers(self, server: socket.socket) -> None:
-        """Multiple Host headers — potential virtual host confusion."""
+        """Multiple Host headers — comma-joined per RFC 9110 §5.2."""
         client = _connect(server)
         try:
             raw = b"GET / HTTP/1.1\r\nHost: legitimate.com\r\nHost: evil.com\r\n\r\n"
@@ -653,11 +653,10 @@ class TestHeaderManipulation:
             status = _get_status_code(response)
             assert status is not None
             if status == 200:
-                # Verify which host the handler sees
+                # Verify duplicate headers are comma-joined (RFC 9110 §5.2)
                 _, _, body = response.partition(b"\r\n\r\n")
                 data = json.loads(body)
-                # Should see one of them consistently (last wins per Python dict)
-                assert data["headers"]["host"] in ("legitimate.com", "evil.com")
+                assert data["headers"]["host"] == "legitimate.com, evil.com"
         finally:
             client.close()
 
@@ -692,7 +691,7 @@ class TestHeaderManipulation:
             client.close()
 
     def test_header_case_sensitivity(self, server: socket.socket) -> None:
-        """Headers with mixed case — verify consistent lowercasing."""
+        """Headers with mixed case — verify consistent lowercasing and comma-joining."""
         client = _connect(server)
         try:
             raw = (
@@ -706,8 +705,8 @@ class TestHeaderManipulation:
             assert response.startswith(b"HTTP/1.1 200 OK\r\n")
             _, _, body = response.partition(b"\r\n\r\n")
             data = json.loads(body)
-            # Last value wins because the headers dict is keyed by lowered name
-            assert data["headers"]["x-mixed-case"] == "value2"
+            # Duplicate headers are comma-joined per RFC 9110 §5.2
+            assert data["headers"]["x-mixed-case"] == "value1, value2"
         finally:
             client.close()
 
@@ -1834,13 +1833,13 @@ class TestBodyParsing:
     """Tests for request body parsing edge cases."""
 
     def test_invalid_json_body(self, crash_server: socket.socket) -> None:
-        """POST with invalid JSON — handler that calls request.json() should fail gracefully."""
+        """POST with invalid JSON — handler that calls json.loads(request.body) should fail gracefully."""
         app = Framework()
 
         @app.route("/json", methods=["POST"])
         def json_handler(request: Request, response: Response) -> None:
             try:
-                data = request.json()
+                data = json.loads(request.body)
                 response.write(json.dumps(data).encode())
             except json.JSONDecodeError, ValueError:
                 response.set_status(400)
@@ -1864,13 +1863,13 @@ class TestBodyParsing:
             break
 
     def test_empty_body_json(self, crash_server: socket.socket) -> None:
-        """POST with empty body — request.json() should raise."""
+        """POST with empty body — json.loads(request.body) should raise."""
         app = Framework()
 
         @app.route("/json", methods=["POST"])
         def json_handler(request: Request, response: Response) -> None:
             try:
-                data = request.json()
+                data = json.loads(request.body)
                 response.write(json.dumps(data).encode())
             except json.JSONDecodeError, ValueError:
                 response.set_status(400)

@@ -35,11 +35,9 @@ def _run_http_server(listen_fd: int) -> None:
     def handle_connection(fd: int) -> None:
         try:
             while True:
-                result = _framework_core.http_read_request(fd, 8192, 1048576)
-                if result is None:
+                request = _framework_core.http_read_request(fd, 8192, 1048576)
+                if request is None:
                     break  # EOF
-
-                _method, _path, _body, keep_alive, _headers = result
 
                 # Generate HTTP response
                 body = b"hello world"
@@ -49,6 +47,9 @@ def _run_http_server(listen_fd: int) -> None:
                     b"\r\n" + body
                 )
                 _framework_core.green_send(fd, resp)
+
+                keep_alive = request._keep_alive
+                request._invalidate()
 
                 if not keep_alive:
                     _framework_core.green_close(fd)

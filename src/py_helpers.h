@@ -82,4 +82,45 @@ typedef struct { void *state; } PyHelperThreadState;
 PyHelperThreadState py_helper_save_thread(void);
 void py_helper_restore_thread(PyHelperThreadState state);
 
+/* Type infrastructure — Py_TYPE() is a macro, tp_free is a function pointer */
+void py_helper_type_free(PyObject *self);
+
+/* Exception type accessor — PyExc_TypeError is a macro-defined global */
+PyObject *py_helper_exc_type_error(void);
+
+/* Type flag constants (macros in CPython) */
+unsigned long py_helper_tpflags_default(void);
+
+/* ---------------------------------------------------------------------------
+ * LazyRequestObject — C struct for layout agreement between C and Zig.
+ * PyObject_HEAD is a macro, so the struct must be defined in C.
+ * ---------------------------------------------------------------------------
+ */
+typedef struct {
+    PyObject_HEAD
+
+    /* Eagerly set (always valid, owned Python objects) */
+    PyObject *method;          /* str */
+    PyObject *path;            /* str (path only, no query) */
+    PyObject *full_path;       /* str (original with query) */
+    int keep_alive;            /* C bool */
+
+    /* Raw pointers into Zig memory (valid while valid==1) */
+    const char *raw_body_ptr;
+    Py_ssize_t  raw_body_len;
+    void       *raw_headers_ptr;   /* Header* in Zig, opaque in C */
+    Py_ssize_t  raw_headers_count;
+    const char *raw_qs_ptr;        /* query string after '?' */
+    Py_ssize_t  raw_qs_len;
+
+    /* Lazily cached Python objects (NULL until first access) */
+    PyObject *cached_body;         /* bytes */
+    PyObject *cached_headers;      /* dict[str, str], keys lowercased, dupes comma-joined */
+    PyObject *cached_query_params; /* dict[str, str] */
+    PyObject *cached_params;       /* dict[str, str] */
+
+    /* Validity flag */
+    int valid;  /* 1 while handler runs, 0 after _invalidate() */
+} LazyRequestObject;
+
 #endif /* PY_HELPERS_H */

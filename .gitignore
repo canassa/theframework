@@ -15,3 +15,5 @@ _framework_core*.so
 .direnv/
 .DS_Store
 .claude/agent-memory/
+.mypy_cache
+.ruff_cache

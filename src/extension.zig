@@ -2,6 +2,7 @@ const py = @cImport({
     @cInclude("py_helpers.h");
 });
 const hub = @import("hub.zig");
+const lazy_request = @import("lazy_request.zig");
 
 const PyObject = py.PyObject;
 const PyMethodDef = py.PyMethodDef;
@@ -323,7 +324,7 @@ pub export fn PyInit__framework_core() callconv(.c) ?*PyObject {
         .ml_name = "http_read_request",
         .ml_meth = @ptrCast(&hub.pyHttpReadRequest),
         .ml_flags = py.py_helper_meth_varargs(),
-        .ml_doc = "Read and parse one HTTP request from fd. Returns (method, path, body, keep_alive, headers) or None on EOF.",
+        .ml_doc = "Read and parse one HTTP request from fd. Returns Request object or None on EOF.",
     };
     methods[21] = .{
         .ml_name = "http_send_response",
@@ -344,5 +345,17 @@ pub export fn PyInit__framework_core() callconv(.c) ?*PyObject {
         .m_clear = null,
         .m_free = null,
     };
-    return py.py_helper_module_create(&module_def);
+    const module = py.py_helper_module_create(&module_def) orelse return null;
+
+    // Intern method strings (GET, POST, etc.)
+    if (!lazy_request.initInternedMethods()) return null;
+
+    // Initialize and register LazyRequest type
+    lazy_request.initLazyRequestType();
+    const request_type: *py.PyTypeObject = @ptrCast(&lazy_request.LazyRequestType);
+    if (py.PyType_Ready(request_type) < 0) return null;
+    py.py_helper_incref(@ptrCast(request_type));
+    if (py.PyModule_AddObject(module, "Request", @ptrCast(request_type)) < 0) return null;
+
+    return module;
 }

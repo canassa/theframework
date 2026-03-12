@@ -166,3 +166,18 @@ PyHelperThreadState py_helper_save_thread(void) {
 void py_helper_restore_thread(PyHelperThreadState state) {
     PyEval_RestoreThread((PyThreadState *)state.state);
 }
+
+/* --- Type infrastructure --- */
+
+void py_helper_type_free(PyObject *self) {
+    Py_TYPE(self)->tp_free(self);
+}
+
+PyObject *py_helper_exc_type_error(void) {
+    return PyExc_TypeError;
+}
+
+unsigned long py_helper_tpflags_default(void) {
+    return Py_TPFLAGS_DEFAULT;
+}
+

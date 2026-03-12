@@ -122,7 +122,7 @@ def json_echo_server() -> Generator[socket.socket]:
     """Server that echoes JSON body back."""
 
     def handler(request: Request, response: Response) -> None:
-        data = request.json()
+        data = json.loads(request.body)
         response.set_header("Content-Type", "application/json")
         response.write(json.dumps(data).encode())
 
@@ -153,7 +153,7 @@ def custom_status_server() -> Generator[socket.socket]:
 
 
 def test_json_echo(json_echo_server: socket.socket) -> None:
-    """POST /echo with JSON body, assert handler reads request.json() and echoes it back."""
+    """POST /echo with JSON body, assert handler reads json.loads(body) and echoes it back."""
     client = _connect(json_echo_server)
     body = json.dumps({"key": "value"}).encode()
     raw = _send_http_request(
@@ -192,3 +192,257 @@ def test_custom_status_and_header(custom_status_server: socket.socket) -> None:
     _, _, resp_body = raw.partition(b"\r\n\r\n")
     assert resp_body == b"created"
     client.close()
+
+
+# ---------------------------------------------------------------------------
+# LazyRequest-specific tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def echo_all_server() -> Generator[socket.socket]:
+    """Server that echoes all request properties as JSON."""
+
+    def handler(request: Request, response: Response) -> None:
+        data = {
+            "method": request.method,
+            "path": request.path,
+            "full_path": request.full_path,
+            "query_params": request.query_params,
+            "headers": request.headers,
+            "body": request.body.decode("latin-1"),
+        }
+        response.set_header("Content-Type", "application/json")
+        response.write(json.dumps(data).encode())
+
+    yield from _start_server(handler)
+
+
+def test_property_values_match(echo_all_server: socket.socket) -> None:
+    """Send a request with known fields, verify every property returns expected values."""
+    client = _connect(echo_all_server)
+    body = b"test body content"
+    raw = _send_http_request(
+        client,
+        "POST",
+        "/hello/world?foo=bar&baz=42",
+        headers={
+            "Content-Type": "text/plain",
+            "X-Custom": "myvalue",
+        },
+        body=body,
+    )
+    assert raw.startswith(b"HTTP/1.1 200 OK\r\n")
+    _, _, resp_body = raw.partition(b"\r\n\r\n")
+    data = json.loads(resp_body)
+    assert data["method"] == "POST"
+    assert data["path"] == "/hello/world"
+    assert data["full_path"] == "/hello/world?foo=bar&baz=42"
+    assert data["query_params"]["foo"] == "bar"
+    assert data["query_params"]["baz"] == "42"
+    assert data["headers"]["content-type"] == "text/plain"
+    assert data["headers"]["x-custom"] == "myvalue"
+    assert data["body"] == "test body content"
+    client.close()
+
+
+def test_duplicate_headers_comma_joined(echo_all_server: socket.socket) -> None:
+    """Duplicate Cache-Control headers should be comma-joined per RFC 9110."""
+    client = _connect(echo_all_server)
+    raw_req = (
+        b"GET / HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Cache-Control: no-cache\r\n"
+        b"Cache-Control: no-store\r\n"
+        b"\r\n"
+    )
+    client.sendall(raw_req)
+    response = b""
+    while b"\r\n\r\n" not in response:
+        chunk = client.recv(8192)
+        if not chunk:
+            break
+        response += chunk
+    header_end = response.index(b"\r\n\r\n") + 4
+    headers_part = response[:header_end].decode()
+    content_length = 0
+    for line in headers_part.split("\r\n"):
+        if line.lower().startswith("content-length:"):
+            content_length = int(line.split(":", 1)[1].strip())
+            break
+    body_so_far = response[header_end:]
+    while len(body_so_far) < content_length:
+        chunk = client.recv(8192)
+        if not chunk:
+            break
+        body_so_far += chunk
+    data = json.loads(body_so_far)
+    assert data["headers"]["cache-control"] == "no-cache, no-store"
+    client.close()
+
+
+def test_header_keys_lowercased(echo_all_server: socket.socket) -> None:
+    """Headers with mixed casing should have lowercased keys."""
+    client = _connect(echo_all_server)
+    raw_req = (
+        b"GET / HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Content-Type: text/html\r\n"
+        b"X-Request-ID: abc123\r\n"
+        b"\r\n"
+    )
+    client.sendall(raw_req)
+    response = b""
+    while b"\r\n\r\n" not in response:
+        chunk = client.recv(8192)
+        if not chunk:
+            break
+        response += chunk
+    header_end = response.index(b"\r\n\r\n") + 4
+    headers_part = response[:header_end].decode()
+    content_length = 0
+    for line in headers_part.split("\r\n"):
+        if line.lower().startswith("content-length:"):
+            content_length = int(line.split(":", 1)[1].strip())
+            break
+    body_so_far = response[header_end:]
+    while len(body_so_far) < content_length:
+        chunk = client.recv(8192)
+        if not chunk:
+            break
+        body_so_far += chunk
+    data = json.loads(body_so_far)
+    assert "content-type" in data["headers"]
+    assert "x-request-id" in data["headers"]
+    # Verify no uppercase keys exist
+    for key in data["headers"]:
+        assert key == key.lower()
+    client.close()
+
+
+def test_direct_construction_blocked() -> None:
+    """_framework_core.Request() should raise TypeError."""
+    with pytest.raises(TypeError, match="cannot be created directly"):
+        _framework_core.Request()
+
+
+def test_eager_fields_survive_invalidation() -> None:
+    """After _invalidate(), method, path, full_path still return correct values."""
+    captured: dict[str, object] = {}
+
+    def handler(request: Request, response: Response) -> None:
+        # Access eager fields before invalidation
+        captured["method"] = request.method
+        captured["path"] = request.path
+        captured["full_path"] = request.full_path
+        # Also access headers to cache them
+        captured["headers_before"] = dict(request.headers)
+        response.write(b"ok")
+
+    gen = _start_server(handler)
+    listen_sock = next(gen)
+    try:
+        client = _connect(listen_sock)
+        _send_http_request(client, "GET", "/test?q=1", headers={"X-Test": "val"})
+        client.close()
+        # Verify the handler saw correct values
+        assert captured["method"] == "GET"
+        assert captured["path"] == "/test"
+        assert captured["full_path"] == "/test?q=1"
+    finally:
+        try:
+            next(gen)
+        except StopIteration:
+            pass
+
+
+def test_invalidation_blocks_uncached_lazy_fields() -> None:
+    """After _invalidate(), accessing uncached body/headers raises RuntimeError."""
+    errors: list[str] = []
+
+    def handler(request: Request, response: Response) -> None:
+        # Do NOT access body or headers (keep them uncached)
+        _ = request.method  # only access eager field
+        # Manually invalidate
+        request._invalidate()
+        # Now try accessing lazy fields that were never cached
+        try:
+            _ = request.body
+            errors.append("body did not raise")
+        except RuntimeError as e:
+            if "after handler returned" not in str(e):
+                errors.append(f"body wrong error: {e}")
+        try:
+            _ = request.headers
+            errors.append("headers did not raise")
+        except RuntimeError as e:
+            if "after handler returned" not in str(e):
+                errors.append(f"headers wrong error: {e}")
+        try:
+            _ = request.query_params
+            errors.append("query_params did not raise")
+        except RuntimeError as e:
+            if "after handler returned" not in str(e):
+                errors.append(f"query_params wrong error: {e}")
+        # Eager fields should still work after invalidation
+        assert request.method == "POST"
+        assert request.path == "/test"
+        assert request.full_path == "/test?x=1"
+        response.write(b"ok")
+
+    gen = _start_server(handler)
+    listen_sock = next(gen)
+    try:
+        client = _connect(listen_sock)
+        raw = _send_http_request(client, "POST", "/test?x=1", body=b"hello")
+        assert raw.startswith(b"HTTP/1.1 200 OK\r\n")
+        client.close()
+        assert errors == [], f"Errors: {errors}"
+    finally:
+        try:
+            next(gen)
+        except StopIteration:
+            pass
+
+
+def test_invalidation_allows_cached_fields() -> None:
+    """After _invalidate(), cached body/headers still return correct values."""
+    results: dict[str, object] = {}
+
+    def handler(request: Request, response: Response) -> None:
+        # Access lazy fields to trigger materialization (caching)
+        body_before = request.body
+        headers_before = dict(request.headers)
+        qp_before = dict(request.query_params)
+        # Now invalidate
+        request._invalidate()
+        # Access them again — should succeed from cache
+        results["body_after"] = request.body
+        results["headers_after"] = dict(request.headers)
+        results["qp_after"] = dict(request.query_params)
+        results["body_match"] = (request.body == body_before)
+        results["headers_match"] = (dict(request.headers) == headers_before)
+        results["qp_match"] = (dict(request.query_params) == qp_before)
+        response.write(b"ok")
+
+    gen = _start_server(handler)
+    listen_sock = next(gen)
+    try:
+        client = _connect(listen_sock)
+        raw = _send_http_request(
+            client, "POST", "/path?key=val",
+            headers={"X-Test": "value"},
+            body=b"body content",
+        )
+        assert raw.startswith(b"HTTP/1.1 200 OK\r\n")
+        client.close()
+        assert results["body_match"] is True
+        assert results["headers_match"] is True
+        assert results["qp_match"] is True
+        assert results["body_after"] == b"body content"
+        assert results["qp_after"] == {"key": "val"}
+    finally:
+        try:
+            next(gen)
+        except StopIteration:
+            pass

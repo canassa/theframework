@@ -124,11 +124,11 @@ def _echo_handler(fd: int) -> None:
 
 def _http_echo_handler(fd: int) -> None:
     """HTTP handler: reads request, sends response with body = method + path."""
-    result = _framework_core.http_read_request(fd, 8192, 1048576)
-    if result is None:
+    request = _framework_core.http_read_request(fd, 8192, 1048576)
+    if request is None:
         return
-    method, path, _body, _keep_alive, _headers = result
-    body = f"{method} {path}".encode()
+    body = f"{request.method} {request.full_path}".encode()
+    request._invalidate()
     resp = b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
     _framework_core.green_send(fd, resp)
     return
@@ -254,10 +254,11 @@ class TestCooperativeTimeSleep:
 
         def _sleep_handler(fd: int) -> None:
             """Handler that sleeps then responds."""
-            result = _framework_core.http_read_request(fd, 8192, 1048576)
-            if result is None:
+            request = _framework_core.http_read_request(fd, 8192, 1048576)
+            if request is None:
                 return
-            _method, path, _body, _keep_alive, _headers = result
+            path = request.full_path
+            request._invalidate()
             if path == "/slow":
                 _framework_core.green_sleep(0.1)
             body = path.encode()

@@ -122,13 +122,13 @@ The `finally: green_close(fd)` block is good, but the connection pool slot may n
 
 ### 8. Request Header Access in Zig Parser ✅ DONE
 
-**Status**: FIXED. Headers are now parsed once in Zig and passed directly to Python as `list[tuple[bytes, bytes]]`.
+**Status**: FIXED. Headers are parsed once in Zig and materialized lazily as `dict[str, str]`
+via the C-level `LazyRequestObject` (see `plans/nocopy.md`).
 
-- `http_read_request()` returns 5-tuple: `(method, path, body, keep_alive, headers)`
-- `Request._from_parsed()` receives pre-parsed headers (no re-parsing from raw bytes)
-- Duplicate headers preserved via `raw_headers` property (list of tuples)
-- ASGI-compatible header format `list[tuple[bytes, bytes]]`
-- See `plans/headers.md` for design details
+- `http_read_request()` returns a `Request` object (C extension type), not a tuple
+- Headers materialized on first `request.headers` access: keys lowercased, duplicates comma-joined per RFC 9110 §5.2
+- No `raw_headers` property (YAGNI — see nocopy.md Design Decisions §2)
+- Query params parsed in Zig via `std.Uri.percentDecodeInPlace`
 
 ---
 
@@ -227,6 +227,39 @@ The `finally: green_close(fd)` block is good, but the connection pool slot may n
 
 **Reference**: [lore.kernel.org thread](https://lore.kernel.org/io-uring/ZwW7_cRr_UpbEC-X@LQ3V64L9R2/T/), [Phoronix coverage](https://www.phoronix.com/news/Linux-6.15-IO_uring), [liburing patches](https://patchwork.kernel.org/project/io-uring/cover/20250215041857.2108684-1-dw@davidwei.uk/)
 
+### 16. Intern Common HTTP Header Keys
+
+**h2o reference**: h2o uses a compile-time-generated token system with 85 pre-allocated header
+name structs (`h2o__tokens[]`). Lookup is a decision tree: switch on length → switch on last
+char → memcmp. After tokenization, header matching throughout the server uses pointer equality
+instead of string comparison. This eliminates all string hashing/comparison overhead for known
+headers.
+
+**Granian**: Does NOT intern header keys. Creates fresh `PyBytes` objects per header per request.
+
+**theframework (current plan)**: The `nocopy.md` plan already interns HTTP method strings
+(GET, POST, etc.) at module init via `PyUnicode_InternFromString`. The same pattern can be
+extended to the ~15-20 most common lowercased header keys (`content-type`, `host`, `accept`,
+`user-agent`, `content-length`, `authorization`, `accept-encoding`, `connection`,
+`cache-control`, `cookie`, etc.).
+
+**How it would work**:
+1. At module init: `PyUnicode_InternFromString("content-type")`, etc. for each common header
+2. In the headers getter: after lowercasing a key into the stack buffer, do a fast lookup
+   (switch on length + last char + memcmp, mirroring h2o's approach) against the interned set
+3. On hit: `incref` the interned `PyUnicode` — skip `PyUnicode_DecodeLatin1` entirely
+4. On miss: fall back to `PyUnicode_DecodeLatin1` for unknown/custom headers
+
+**Benefits**:
+- Saves a `PyUnicode` allocation for ~5-8 headers per request (the common ones)
+- CPython's dict uses identity comparison as a fast path before `__eq__`, so interned keys
+  also speed up dict lookups by consumers (`request.headers["content-type"]`)
+- Low complexity — same pattern as the existing method interning
+
+**Priority**: P3 — profile first to confirm header dict construction is a bottleneck. The
+lazy materialization in `nocopy.md` already eliminates the cost entirely when `headers` is
+never accessed.
+
 ---
 
 ## Summary Priority Matrix
@@ -248,6 +281,7 @@ The `finally: green_close(fd)` block is good, but the connection pool slot may n
 | **P2** | Lifecycle hooks | Low | App initialization/teardown | Open |
 | **P2** | PID file | Trivial | Process management | Open |
 | **P3** | io_uring ZC RX | High | Eliminate last recv copy (datacenter NIC required, kernel 6.15+) | Open |
+| **P3** | Intern common header keys | Low | Skip PyUnicode alloc for ~8 headers/request, faster dict lookups | Open |
 
 ---
 ---
@@ -305,26 +339,11 @@ Framework.run(max_header_size=32768, max_body_size=1048576)
 
 Limits are enforced both in the arena allocator (Zig) and in the request handler (Python).
 
-### Q4. Double close on keep-alive=false path
+### Q4. Double close on keep-alive=false path ✅ FIXED
 
-**File:** `server.py:42-48`
-
-```python
-if not keep_alive:
-    _framework_core.green_close(fd)  # ← close here
-    return
-# ...
-finally:
-    _framework_core.green_close(fd)  # ← and also close here
-```
-
-When `keep_alive` is False, `green_close` is called, then execution falls through to the `finally`
-block which calls `green_close` **again** on the same fd. The Zig side handles an unknown fd
-gracefully (falls through to `IGNORE_SENTINEL` close), but between the two closes the kernel might
-have reused the fd number for a different connection — closing someone else's socket.
-
-**Fix:** Remove the explicit close in the `if not keep_alive` branch and just `return` (the
-`finally` block handles it). Or set a `closed` flag.
+**Status**: FIXED in the nocopy refactor. `_handle_connection` now only closes the fd in the
+outer `finally` block. The `if not request._keep_alive: return` branch simply returns, letting
+the `finally` block handle the close. No more double close.
 
 ### Q5. Inconsistent connection state on greenlet switch failure
 
@@ -400,10 +419,10 @@ Deleted: `formatLargeResponse()`, `pyHttpFormatResponseFull()`, the 64KB stack b
 
 ### Q9. Headers parsed twice (Zig then Python) ✅ FIXED
 
-**Status**: FIXED. Headers are now parsed once in Zig and passed to Python as
-`list[tuple[bytes, bytes]]`. The old `_from_raw()` method with its fragile Python-side
-re-parsing has been replaced by `_from_parsed()` which receives pre-parsed headers directly.
-See item #8 above and `plans/headers.md`.
+**Status**: FIXED. Headers are parsed once in Zig and materialized lazily as `dict[str, str]`
+on first access via the C-level `LazyRequestObject`. The old Python-side `Request` class with
+`_from_raw()` / `_from_parsed()` has been replaced entirely by the C extension type.
+See item #8 above and `plans/nocopy.md`.
 
 ### Q10. No TCP_NODELAY on accepted connections
 
@@ -491,13 +510,12 @@ one-at-a-time. `ring.zig` already has `prepAcceptMultishot` but it's unused.
 
 **Fix:** Use multishot accept to handle bursts without per-connection SQE submission.
 
-### Q16. Python header dict drops duplicate headers ⚠️ PARTIALLY FIXED
+### Q16. Python header dict drops duplicate headers ✅ FIXED
 
-**Status**: Dict access (`request.headers`) still uses a dict (last value wins for duplicates),
-but `request.raw_headers` now provides the full `list[tuple[bytes, bytes]]` preserving all
-duplicates. Applications that need duplicate header access can use `raw_headers`.
-
-**Remaining**: Consider replacing the dict with a multidict for `request.headers` for full compliance.
+**Status**: FIXED in the nocopy refactor. `request.headers` now comma-joins duplicate header
+values per RFC 9110 §5.2 (e.g., two `Cache-Control` headers become `"no-cache, no-store"`).
+This is spec-compliant and matches WSGI server behavior (Gunicorn, uWSGI). The `raw_headers`
+property was dropped (YAGNI). See `plans/nocopy.md` Design Decisions §3.
 
 ### Q17. pyHttpFormatResponse has a 64KB response limit ⚠️ MITIGATED
 
@@ -624,7 +642,7 @@ The existing implementation has several well-designed patterns worth preserving:
 | Q1 | O(n²) request buffer accumulation | **P0** | Low | Memory blowup on large requests | ✅ FIXED |
 | Q2 | Pool exhaustion → fd leak | **P0** | Low | Connection leak under load | ✅ FIXED |
 | Q3 | No request size limit | **P0** | Low | OOM under attack/misconfiguration | ✅ FIXED |
-| Q4 | Double close on keep-alive=false | **P0** | Trivial | Potential fd reuse race | Open |
+| Q4 | Double close on keep-alive=false | **P0** | Trivial | Potential fd reuse race | ✅ FIXED |
 | Q5 | Inconsistent state on switch failure | **P0** | Medium | Potential double-resume crash | Open |
 | Q6 | MAX_FDS=4096 fixed array | **P1** | Medium | Untracked fds with many open files | Open |
 | Q7 | Alloc/free per recv | **P1** | Medium | Allocation pressure under load | ✅ PARTIALLY FIXED |
@@ -636,7 +654,7 @@ The existing implementation has several well-designed patterns worth preserving:
 | Q13 | No SO_REUSEPORT | **P2** | Trivial | Needed for future multi-worker | ✅ FIXED |
 | Q14 | Pool slot leak on alloc failure | **P2** | Trivial | Use appendAssumeCapacity | Open |
 | Q15 | No multishot accept | **P2** | Medium | Accept throughput under burst | Open |
-| Q16 | Duplicate headers dropped | **P2** | Low | HTTP compliance | ⚠️ PARTIALLY FIXED |
+| Q16 | Duplicate headers dropped | **P2** | Low | HTTP compliance | ✅ FIXED |
 | Q17 | 64KB response buffer limit | **P2** | Low | Affects Zig-side response path | ⚠️ MITIGATED |
 | Q18 | Global singleton hub | **P2** | High | Testing, multi-worker | Open |
 | Q19 | No Connection header in response | **P2** | Trivial | Proxy cooperation | Open |
